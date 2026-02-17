@@ -33,6 +33,37 @@ def get_default_args():
                 if key in defaults: defaults[key] = float(defaults[key])
     return defaults
 
+def run_standard_inference(args):
+    """
+    Chạy inference.py chuẩn bằng subprocess với đầy đủ tham số.
+    """
+    cmd = [
+        'python', 'inference.py',
+        '--checkpoint_path', args.checkpoint_path,
+        '--face', args.face,
+        '--audio', args.audio,
+        '--outfile', args.outfile,
+        '--fps', str(args.fps),
+        '--pads', *[str(p) for p in args.pads],
+        '--resize_factor', str(args.resize_factor),
+        '--wav2lip_batch_size', str(args.wav2lip_batch_size),
+    ]
+    
+    # Thêm các cờ boolean nếu cần
+    if args.nosmooth:
+        cmd.append('--nosmooth')
+    if args.rotate:
+        cmd.append('--rotate')
+        
+    # Xử lý Quality/Enhance cho inference.py chuẩn
+    # inference.py gốc thường dùng --quality
+    if args.enhance:
+        cmd.extend(['--quality', 'Enhanced'])
+    else:
+        cmd.extend(['--quality', 'Improved']) # hoặc Fast tùy chọn mặc định
+
+    subprocess.run(cmd, check=False)
+
 def main():
     defaults = get_default_args()
     parser = argparse.ArgumentParser(description='Easy Wav2Lip - Fork Optimized by Hyhy3008')
@@ -72,19 +103,17 @@ def main():
         except Exception as e:
             print(f"\n❌ Lỗi Fast Pipeline: {e}")
             print("🔄 Đang chuyển về chế độ chuẩn (Standard)...")
-            # SỬA LỖI: Dùng subprocess để chạy inference.py chuẩn, tránh lỗi biến global
-            subprocess.run(['python', 'inference.py'], check=False)
+            run_standard_inference(args)
             
     elif args.fast and not PIPELINE_AVAILABLE:
         print("\nCảnh báo: Không tìm thấy module Pipeline. Chạy chế độ chuẩn.")
-        subprocess.run(['python', 'inference.py'], check=False)
+        run_standard_inference(args)
         
     else:
         print("\n" + "="*50)
         print("   CHẾ ĐỘ CHUẨN (STANDARD MODE)")
         print("="*50)
-        # SỬA LỖI: Dùng subprocess để chạy inference.py chuẩn
-        subprocess.run(['python', 'inference.py'], check=False)
+        run_standard_inference(args)
 
 if __name__ == "__main__":
     main()

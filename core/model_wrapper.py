@@ -4,7 +4,8 @@ import numpy as np
 import os
 from easy_functions import load_model
 from batch_face import RetinaFace
-from enhance import load_sr
+# Import các hàm cần thiết từ enhance.py
+from enhance import load_sr, upscale
 
 class Wav2LipModelWrapper:
     def __init__(self, checkpoint_path, device='cuda', face_det_batch_size=16, 
@@ -16,70 +17,75 @@ class Wav2LipModelWrapper:
         
         print(f"[Wrapper] Loading Wav2Lip model from {checkpoint_path}...")
         self.model = load_model(checkpoint_path, device)
-        self.model.eval() # Quan trọng: Chuyển sang chế độ đánh giá
+        self.model.eval()
         
-        # Load Face Detector
         print("[Wrapper] Loading Face Detector (RetinaFace)...")
         gpu_id = 0 if device == 'cuda' else -1
         self.face_detector = RetinaFace(gpu_id=gpu_id)
         
-        # Load Enhance Model (GFPGAN/RestoreFormer) nếu cần
+        # Load Enhance Model (GFPGAN/RestoreFormer)
         self.enhancer = None
         self.segmenter = None
         if self.enhance:
             print("[Wrapper] Loading Enhancement Model...")
-            # logic load_sr từ enhance.py của repo gốc
-            self.enhancer, self.segmenter = load_sr(segmentation_path)
+            try:
+                self.enhancer, self.segmenter = load_sr(segmentation_path)
+            except Exception as e:
+                print(f"[Wrapper] Warning: Could not load Enhancement model. Error: {e}")
+                self.enhance = False
 
-        # Kỹ thuật Warmup từ OpenAvatarChat để giảm độ trễ frame đầu
         self._warmup()
 
     def _warmup(self):
         print("[Wrapper] Warming up GPU context...")
         try:
-            # Tạo dummy input
-            # Kích thước input Wav2Lip thường là 96x96 (hoặc 128 tùy model)
-            # Chúng ta thử infer 1 lần để load CUDA kernel
-            dummy_mel = torch.zeros(1, 1, 80, 16).to(self.device)
-            # Lưu ý: Input của Wav2Lip thường là (B, 6, H, W) nếu có previous frame
-            # Hoặc (B, 3, H, W). Tùy version. 
-            # Ở đây dùng đơn giản để trigger load weight.
             if self.device == 'cuda':
+                # Dummy pass to init CUDA kernels
+                # Tạo input giả lập phù hợp với kích thước model (thường là 96x96)
+                dummy_mel = torch.zeros(1, 1, 80, 16).to(self.device)
+                # Model Wav2Lip thường nhận input ảnh (B, 6, 96, 96) hoặc (B, 3, 96, 96)
+                # Tùy version, nhưng warmup bằng zeros an toàn
                 torch.cuda.synchronize()
-            print("[Wrapper] Warmup complete.")
+                print("[Wrapper] Warmup complete.")
         except Exception as e:
-            print(f"[Wrapper] Warmup skipped or failed (non-critical): {e}")
+            print(f"[Wrapper] Warmup skipped: {e}")
 
     @torch.no_grad()
-    def infer_batch(self, face_crops, mel_chunks):
+    def infer_batch(self, img_batch, mel_batch):
         """
-        Thực hiện inference cho một batch.
+        Chạy Wav2Lip inference.
         Input: 
-            face_crops: List các ảnh numpy (H, W, 3) hoặc Tensor (B, ...)
-            mel_chunks: List các mel spectrogram
-        Return:
-            List các ảnh kết quả (numpy arrays)
+            img_batch: Tensor (B, C, H, W) normalized [-1, 1]
+            mel_batch: Tensor (B, 1, 80, 16)
+        Output: Numpy array (B, H, W, C) uint8
         """
-        # Logic chuẩn bị dữ liệu input cho model
-        # Code gốc Easy-Wav2Lip thường xử lý việc concat previous frame ở đây.
-        # Để đơn giản, ta giả sử input đã được xử lý bởi datagen (như code gốc)
+        # Wav2Lip Forward
+        pred = self.model(img_batch, mel_batch)
         
-        # Chuyển đổi sang Tensor
-        # Lưu ý: Phần này cần khớp với logic `inference.py` gốc (hàm `datagen`)
-        # Trong kiến trúc mới, ta sẽ đưa logic datagen vào Pipeline, còn Wrapper chỉ việc nhận Tensor đã chuẩn.
+        # Post-process
+        pred = pred.cpu().numpy()
+        # Transpose (B, C, H, W) -> (B, H, W, C)
+        if pred.shape[1] == 3:
+            pred = np.transpose(pred, (0, 2, 3, 1))
+            
+        # Denormalize về 0-255
+        pred = (pred + 1) * 127.5
+        pred = pred.astype(np.uint8)
         
-        # Giả lập gọi model
-        # img_batch = torch.tensor(face_crops).to(self.device)
-        # mel_batch = torch.tensor(mel_chunks).to(self.device)
-        
-        # results = self.model(img_batch, mel_batch)
-        
-        # results_np = results.cpu().numpy()
-        return [] # Trả về danh sách ảnh kết quả
+        return pred
 
     def enhance_face(self, face_image):
+        """
+        Nét hóa khuôn mặt (nếu bật Enhance).
+        Input: Ảnh numpy (H, W, C)
+        Output: Ảnh đã enhance
+        """
         if not self.enhance or self.enhancer is None:
             return face_image
-        # Gọi hàm upscale từ enhance.py
-        # Logic enhance.py thường trả về ảnh đã scale
-        return face_image
+        
+        try:
+            # Hàm upscale từ enhance.py xử lý numpy array
+            return upscale(face_image, self.enhancer, self.segmenter)
+        except Exception as e:
+            print(f"[Wrapper] Enhance error: {e}")
+            return face_image

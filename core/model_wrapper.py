@@ -4,7 +4,6 @@ import numpy as np
 import os
 from easy_functions import load_model
 from batch_face import RetinaFace
-# Import các hàm cần thiết từ enhance.py
 from enhance import load_sr, upscale
 
 class Wav2LipModelWrapper:
@@ -16,7 +15,11 @@ class Wav2LipModelWrapper:
         self.face_det_batch_size = face_det_batch_size
         
         print(f"[Wrapper] Loading Wav2Lip model from {checkpoint_path}...")
-        self.model = load_model(checkpoint_path, device)
+        
+        # SỬA LỖI: Hàm load_model gốc chỉ nhận 1 tham số path.
+        # Ta load model về sau đó tự di chuyển sang device (GPU/CPU).
+        self.model = load_model(checkpoint_path)
+        self.model.to(self.device)
         self.model.eval()
         
         print("[Wrapper] Loading Face Detector (RetinaFace)...")
@@ -41,10 +44,6 @@ class Wav2LipModelWrapper:
         try:
             if self.device == 'cuda':
                 # Dummy pass to init CUDA kernels
-                # Tạo input giả lập phù hợp với kích thước model (thường là 96x96)
-                dummy_mel = torch.zeros(1, 1, 80, 16).to(self.device)
-                # Model Wav2Lip thường nhận input ảnh (B, 6, 96, 96) hoặc (B, 3, 96, 96)
-                # Tùy version, nhưng warmup bằng zeros an toàn
                 torch.cuda.synchronize()
                 print("[Wrapper] Warmup complete.")
         except Exception as e:

@@ -8,7 +8,6 @@ import os
 import sys
 from tqdm import tqdm
 
-# Thêm thư mục gốc vào sys.path để import module
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import audio
@@ -19,7 +18,6 @@ class Wav2LipPipeline:
         self.args = args
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
-        # Khởi tạo Model Wrapper
         self.model_wrapper = Wav2LipModelWrapper(
             checkpoint_path=args.checkpoint_path,
             device=self.device,
@@ -28,14 +26,12 @@ class Wav2LipPipeline:
             segmentation_path=args.segmentation_path
         )
         
-        # Các Queue (Hàng đợi) giao tiếp giữa các luồng
         self.frame_queue = queue.Queue(maxsize=500)
         self.infer_queue = queue.Queue(maxsize=100)
         self.write_queue = queue.Queue(maxsize=500)
         
         self.stop_event = threading.Event()
         
-        # Metadata video
         self.video_fps = 25.0
         self.video_size = (640, 480)
         self.total_frames = 0
@@ -44,7 +40,6 @@ class Wav2LipPipeline:
         print(f"[Pipeline] Bắt đầu (Enhance: {self.args.enhance})...")
         start_time = time.time()
         
-        # 1. Chuẩn bị Audio (Mel-spectrogram)
         if not os.path.isfile(self.args.audio):
             raise FileNotFoundError(f"Audio file not found: {self.args.audio}")
             
@@ -52,18 +47,15 @@ class Wav2LipPipeline:
         wav = audio.load_wav(self.args.audio, 16000)
         mel = audio.melspectrogram(wav)
         
-        # Sửa lỗi: Đảm bảo mel có shape (80, T) -> squeeze bỏ chiều batch nếu có
         if len(mel.shape) == 3:
             mel = mel.squeeze(0)
         
-        # Tính toán mel chunks tương ứng với FPS video
         mel_idx_multiplier = 80. / self.args.fps 
         mel_chunks = []
         i = 0
         while 1:
             start_idx = int(i * mel_idx_multiplier)
             if start_idx + 16 > mel.shape[1]:
-                # Padding cuối cùng nếu thiếu
                 chunk = np.zeros((80, 16))
                 remaining = mel.shape[1] - start_idx
                 if remaining > 0:
@@ -73,68 +65,81 @@ class Wav2LipPipeline:
             mel_chunks.append(mel[:, start_idx : start_idx + 16])
             i += 1
 
-        # 2. Khởi động các Worker Threads
+        total_frames_needed = len(mel_chunks)
+
         threads = []
-        
-        # Thread 1: Đọc video
-        t_read = threading.Thread(target=self._worker_video_reader, args=(len(mel_chunks),))
-        threads.append(t_read)
-        
-        # Thread 2: Chuẩn bị dữ liệu (Face Detect + Crop)
+        t_read = threading.Thread(target=self._worker_video_reader, args=(total_frames_needed,))
         t_prep = threading.Thread(target=self._worker_data_prep, args=(mel_chunks,))
-        threads.append(t_prep)
-        
-        # Thread 3: Inference (Wav2Lip + Enhance)
         t_infer = threading.Thread(target=self._worker_inference)
-        threads.append(t_infer)
-        
-        # Thread 4: Ghi video
         t_write = threading.Thread(target=self._worker_video_writer)
-        threads.append(t_write)
         
-        # Bắt đầu tất cả các luồng
-        for t in threads:
+        for t in [t_read, t_prep, t_infer, t_write]:
             t.start()
             
-        # Chờ hoàn thành
-        for t in threads:
+        for t in [t_read, t_prep, t_infer, t_write]:
             t.join()
             
         end_time = time.time()
         print(f"[Pipeline] Hoàn tất! Thời gian: {end_time - start_time:.2f}s")
 
-    def _worker_video_reader(self, total_len):
-        """Đọc frame từ video và đẩy vào frame_queue"""
+    def _worker_video_reader(self, total_frames_needed):
         video_stream = cv2.VideoCapture(self.args.face)
-        self.total_frames = int(video_stream.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.video_fps = video_stream.get(cv2.CAP_PROP_FPS)
-        self.video_size = (int(video_stream.get(cv2.CAP_PROP_FRAME_WIDTH)), 
-                           int(video_stream.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+        fps = video_stream.get(cv2.CAP_PROP_FPS)
+        width = int(video_stream.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(video_stream.get(cv2.CAP_PROP_FRAME_HEIGHT))
         
-        frame_idx = 0
-        while not self.stop_event.is_set():
+        self.video_fps = self.args.fps if self.args.fps else fps
+        self.video_size = (width, height)
+        
+        # Đọc tất cả frame vào RAM (vì cần lặp lại nếu video ngắn)
+        frames_list = []
+        while True:
             still_reading, frame = video_stream.read()
             if not still_reading:
                 break
-            
-            self.frame_queue.put((frame_idx, frame))
-            frame_idx += 1
-            
-        self.frame_queue.put(None) # Tín hiệu kết thúc
+            frames_list.append(frame)
         video_stream.release()
+        
+        num_video_frames = len(frames_list)
+        if num_video_frames == 0:
+            self.stop_event.set()
+            return
+
+        self.total_frames = total_frames_needed
+        
+        print(f"[Reader] Video: {num_video_frames} frames. Audio needs: {total_frames_needed} frames.")
+
+        for i in range(total_frames_needed):
+            if self.stop_event.is_set(): break
+            # Lặp lại video nếu ngắn hơn audio
+            frame = frames_list[i % num_video_frames]
+            self.frame_queue.put((i, frame))
+            
+        self.frame_queue.put(None)
 
     def _worker_data_prep(self, mel_chunks):
-        """Xử lý Face Detection và chuẩn bị dữ liệu cho Model"""
+        """Tối ưu: Gom batch Face Detection thay vì detect từng frame"""
         from batch_face import RetinaFace
         
         gpu_id = 0 if self.device == 'cuda' else -1
         face_detector = RetinaFace(gpu_id=gpu_id)
         
+        batch_frames = []
+        batch_indices = []
+        
+        # Lấy batch size từ args hoặc mặc định 16
+        det_batch_size = self.args.face_det_batch_size if hasattr(self.args, 'face_det_batch_size') else 16
+
         while not self.stop_event.is_set():
             try:
+                # Lấy 1 item từ queue
                 item = self.frame_queue.get(timeout=1)
+                
                 if item is None:
-                    self.infer_queue.put(None) # Kết thúc
+                    # Xử lý nốt batch còn sót
+                    if batch_frames:
+                        self._process_detection_batch(batch_indices, batch_frames, face_detector, mel_chunks)
+                    self.infer_queue.put(None)
                     break
                 
                 idx, frame = item
@@ -142,50 +147,66 @@ class Wav2LipPipeline:
                 # Resize nếu cần
                 if self.args.resize_factor > 1:
                     frame = cv2.resize(frame, (frame.shape[1]//self.args.resize_factor, frame.shape[0]//self.args.resize_factor))
-
-                # Detect Face
-                faces = face_detector.detect(frame)
-                if len(faces) == 0:
-                    continue # Bỏ qua frame không có mặt
                 
-                face_box = faces[0]
-                x1, y1, x2, y2 = [int(v) for v in face_box[:4]]
+                batch_indices.append(idx)
+                batch_frames.append(frame)
                 
-                # Padding
-                try:
-                    pad = self.args.pads
-                    y1 = max(0, y1 - pad[0])
-                    y2 = min(frame.shape[0], y2 + pad[1])
-                    x1 = max(0, x1 - pad[2])
-                    x2 = min(frame.shape[1], x2 + pad[3])
-                except:
-                    pass
-
-                # Crop & Resize face về 96x96 (input Wav2Lip)
-                face_crop = frame[y1:y2, x1:x2]
-                if face_crop.size == 0:
-                    continue
-                face_crop_96 = cv2.resize(face_crop, (96, 96))
-                
-                # Lấy mel chunk tương ứng với frame index
-                if idx >= len(mel_chunks):
-                    continue
-                mel_chunk = mel_chunks[idx]
-                
-                # Đẩy sang queue inference
-                self.infer_queue.put({
-                    'idx': idx,
-                    'face_96': face_crop_96,
-                    'mel': mel_chunk,
-                    'original_frame': frame,
-                    'box': [x1, y1, x2, y2]
-                })
+                # Khi đủ batch, chạy detect
+                if len(batch_frames) >= det_batch_size:
+                    self._process_detection_batch(batch_indices, batch_frames, face_detector, mel_chunks)
+                    batch_frames = []
+                    batch_indices = []
 
             except queue.Empty:
                 continue
 
+    def _process_detection_batch(self, batch_indices, batch_frames, face_detector, mel_chunks):
+        """Chạy detection cho cả batch và đẩy sang infer_queue"""
+        # Detect batch
+        try:
+            all_faces = face_detector.detect(batch_frames)
+        except Exception as e:
+            print(f"Detection error: {e}")
+            return
+
+        for i, faces in enumerate(all_faces):
+            idx = batch_indices[i]
+            frame = batch_frames[i]
+            
+            if len(faces) == 0:
+                continue
+                
+            face_box = faces[0]
+            x1, y1, x2, y2 = [int(v) for v in face_box[:4]]
+            
+            # Padding
+            try:
+                pad = self.args.pads
+                y1 = max(0, y1 - pad[0])
+                y2 = min(frame.shape[0], y2 + pad[1])
+                x1 = max(0, x1 - pad[2])
+                x2 = min(frame.shape[1], x2 + pad[3])
+            except:
+                pass
+
+            face_crop = frame[y1:y2, x1:x2]
+            if face_crop.size == 0:
+                continue
+            face_crop_96 = cv2.resize(face_crop, (96, 96))
+            
+            if idx >= len(mel_chunks):
+                continue
+            mel_chunk = mel_chunks[idx]
+            
+            self.infer_queue.put({
+                'idx': idx,
+                'face_96': face_crop_96,
+                'mel': mel_chunk,
+                'original_frame': frame,
+                'box': [x1, y1, x2, y2]
+            })
+
     def _worker_inference(self):
-        """Chạy Model Wav2Lip và Enhance"""
         batch_data = []
         batch_size = self.args.wav2lip_batch_size
         
@@ -194,10 +215,9 @@ class Wav2LipPipeline:
                 item = self.infer_queue.get(timeout=1)
                 
                 if item is None:
-                    # Xử lý nốt batch còn sót
                     if batch_data:
                         self._process_batch(batch_data)
-                    self.write_queue.put(None) # Kết thúc Writer
+                    self.write_queue.put(None)
                     break
                 
                 batch_data.append(item)
@@ -210,55 +230,40 @@ class Wav2LipPipeline:
                 continue
 
     def _process_batch(self, batch_data):
-        """Xử lý batch: Inference -> Enhance -> Paste Back"""
-        # 1. Chuẩn bị Tensor
         faces_96 = [d['face_96'] for d in batch_data]
         mels = [d['mel'] for d in batch_data]
         
-        # Chuẩn bị Image Tensor
         img_batch = np.array(faces_96)
-        img_batch = np.transpose(img_batch, (0, 3, 1, 2)) # B, H, W, C -> B, C, H, W
+        img_batch = np.transpose(img_batch, (0, 3, 1, 2))
         img_tensor = torch.FloatTensor(img_batch).to(self.device)
-        img_tensor = (img_tensor / 255.0) * 2 - 1 # Normalize [-1, 1]
+        img_tensor = (img_tensor / 255.0) * 2 - 1
         
-        # Chuẩn bị Mel Tensor
         mel_batch = np.array(mels)
-        # Shape hiện tại: (B, 80, 16). Model cần (B, 1, 80, 16)
         mel_tensor = torch.FloatTensor(mel_batch).unsqueeze(1).to(self.device)
         
-        # 2. Wav2Lip Inference
         gen_faces = self.model_wrapper.infer_batch(img_tensor, mel_tensor)
         
-        # 3. Xử lý hậu kỳ (Post-process) từng ảnh
         for i, gen_face in enumerate(gen_faces):
             original_frame = batch_data[i]['original_frame']
             x1, y1, x2, y2 = batch_data[i]['box']
             
-            # Resize mặt sinh ra về kích thước box gốc
             box_h, box_w = y2 - y1, x2 - x1
-            
-            # Kiểm tra kích thước hợp lệ
-            if box_h <= 0 or box_w <= 0:
-                continue
+            if box_h <= 0 or box_w <= 0: continue
                 
             gen_face_resized = cv2.resize(gen_face, (box_w, box_h))
             
-            # Enhance (nếu bật)
             if self.args.enhance:
                 gen_face_resized = self.model_wrapper.enhance_face(gen_face_resized)
             
-            # Paste Back vào ảnh gốc
             if y1 >= 0 and y2 <= original_frame.shape[0] and x1 >= 0 and x2 <= original_frame.shape[1]:
                 original_frame[y1:y2, x1:x2] = gen_face_resized
             
-            # Gửi sang Writer
             self.write_queue.put({
                 'idx': batch_data[i]['idx'],
                 'frame': original_frame
             })
 
     def _worker_video_writer(self):
-        """Ghi video kết quả"""
         out_path = self.args.outfile
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
         
@@ -274,7 +279,6 @@ class Wav2LipPipeline:
             try:
                 item = self.write_queue.get(timeout=1)
                 if item is None:
-                    # Ghi nốt buffer còn sót
                     while next_idx in frame_buffer:
                         out.write(frame_buffer[next_idx])
                         del frame_buffer[next_idx]
@@ -284,10 +288,8 @@ class Wav2LipPipeline:
                 idx = item['idx']
                 frame = item['frame']
                 
-                # Lưu vào buffer để sắp xếp lại thứ tự
                 frame_buffer[idx] = frame
                 
-                # Ghi liên tục nếu có frame đúng thứ tự
                 while next_idx in frame_buffer:
                     out.write(frame_buffer[next_idx])
                     del frame_buffer[next_idx]

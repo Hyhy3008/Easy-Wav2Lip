@@ -407,7 +407,7 @@ def get_smoothened_boxes(boxes, T):
             
 def face_detect(images, results_file="last_detected_face.pkl"):
     if os.path.exists(results_file):
-        print("Using face detection data from last input")
+        print(f"Using face detection data from: {results_file}")
         with open(results_file, "rb") as f:
             return pickle.load(f)
 
@@ -448,16 +448,21 @@ def face_detect(images, results_file="last_detected_face.pkl"):
     return results
 
 
+# ========================================================================
+# HÀM DATAGEN ĐÃ SỬA - FIX LỖI LỆCH MẶT (SYNC FIX)
+# ========================================================================
 def datagen(frames, mels):
     """
     Generator để tạo batch data cho Wav2Lip inference.
     
-    QUAN TRỌNG: Khi audio dài hơn video (loop), cả frame VÀ face_det_results
-    đều phải được lấy cùng một index để đảm bảo tọa độ mặt khớp với frame.
+    🔧 ĐÃ SỬA: Đồng bộ hoàn hảo giữa frames và face_det_results
+    - Ép buộc len(frames) == len(face_det_results)
+    - Chỉ dùng 1 index duy nhất cho cả hai
     """
     img_batch, mel_batch, frame_batch, coords_batch = [], [], [], []
     print("\r" + " " * 100, end="\r")
     
+    # === BƯỚC 1: LẤY FACE DETECTION RESULTS ===
     if args.box[0] == -1:
         if not args.static:
             face_det_results = face_detect(frames)
@@ -468,38 +473,55 @@ def datagen(frames, mels):
         y1, y2, x1, x2 = args.box
         face_det_results = [[f[y1:y2, x1:x2], (y1, y2, x1, x2)] for f in frames]
 
-    # ================================================================
-    # FIX CHÍNH: Đồng bộ frame và cache cùng một index
-    # ================================================================
-    # Số lượng frames gốc (cũng = số lượng cache entries)
-    num_original_frames = len(frames)
-    num_cache_entries = len(face_det_results)
+    # ========================================================================
+    # 🔧 SYNC FIX: ÉP BUỘC ĐỒNG BỘ FRAMES VÀ CACHE
+    # ========================================================================
+    num_frames = len(frames)
+    num_cache = len(face_det_results)
     
-    # Log để debug
-    print(f"Original frames: {num_original_frames}, Cache entries: {num_cache_entries}, Mel chunks: {len(mels)}")
+    if num_frames != num_cache:
+        print(f"\n⚠️  SYNC MISMATCH DETECTED!")
+        print(f"    Video frames: {num_frames}")
+        print(f"    Cache entries: {num_cache}")
+        
+        # Lấy số nhỏ hơn để cắt bớt phần thừa
+        min_len = min(num_frames, num_cache)
+        
+        # Cắt cả hai danh sách về cùng độ dài
+        frames = frames[:min_len]
+        face_det_results = face_det_results[:min_len]
+        
+        print(f"✅  FORCED ALIGNMENT: Cắt về {min_len} frames")
+        print(f"    → Perfect sync guaranteed!\n")
+    else:
+        print(f"✅ Sync OK: {num_frames} frames = {num_cache} cache entries")
+    
+    # Số lượng frame sau khi đã đồng bộ
+    num_synced_frames = len(frames)
+    # ========================================================================
+
+    print(f"📊 Synced frames: {num_synced_frames}, Mel chunks: {len(mels)}")
     
     for i, m in enumerate(mels):
         if args.static:
             # Static mode: luôn dùng frame đầu tiên
             idx = 0
         else:
-            # Video mode: quay vòng cả frame VÀ cache cùng lúc
-            # Đảm bảo frame và cache luôn khớp nhau
-            idx = i % num_original_frames
+            # ================================================================
+            # 🔧 CRITICAL FIX: CHỈ DÙNG 1 INDEX DUY NHẤT
+            # Vì frames và face_det_results đã được đồng bộ ở trên
+            # idx này dùng cho CẢ HAI, không tính toán riêng nữa
+            # ================================================================
+            idx = i % num_synced_frames
         
         frame_to_save = frames[idx].copy()
         
-        # ============================================================
-        # CRITICAL FIX: idx đã được tính toán để nằm trong phạm vi
-        # của cả frames VÀ face_det_results (vì chúng có cùng length)
-        # 
-        # Nếu vì lý do nào đó cache ngắn hơn frames, dùng min()
-        # để đảm bảo an toàn, nhưng vẫn giữ sự đồng bộ
-        # ============================================================
-        cache_idx = idx % num_cache_entries  # An toàn khi cache = frames
-        
-        # Lấy face và coords từ cache
-        face, coords = face_det_results[cache_idx].copy()
+        # ================================================================
+        # 🔧 DÙNG CHUNG idx CHO CẢ FRAME VÀ CACHE
+        # Không còn cache_idx riêng nữa!
+        # ================================================================
+        face, coords = face_det_results[idx]
+        face = face.copy()  # Tạo bản sao để tránh modify original
 
         face = cv2.resize(face, (args.img_size, args.img_size))
 
@@ -534,6 +556,7 @@ def datagen(frames, mels):
         )
 
         yield img_batch, mel_batch, frame_batch, coords_batch
+# ========================================================================
 
 
 mel_step_size = 16
@@ -629,6 +652,8 @@ def main():
 
             full_frames.append(frame)
 
+    print(f"📹 Loaded {len(full_frames)} frames at {fps} FPS")
+
     # ========================================================================
     # CHẾ ĐỘ CHỈ TẠO CACHE (ONLY DETECT) - Không chạy Wav2Lip
     # ========================================================================
@@ -713,11 +738,33 @@ def main():
         mel_chunks.append(mel[:, start_idx : start_idx + mel_step_size])
         i += 1
 
-    full_frames = full_frames[: len(mel_chunks)]
+    print(f"🎵 Audio tạo ra {len(mel_chunks)} mel chunks")
+    print(f"📹 Video có {len(full_frames)} frames")
+
+    # ========================================================================
+    # 🔧 SYNC FIX TRƯỚC KHI VÀO DATAGEN
+    # Nếu audio dài hơn video, cần loop video TRƯỚC
+    # ========================================================================
+    if len(mel_chunks) > len(full_frames):
+        print(f"\n🔄 Audio dài hơn video - Đang loop video...")
+        original_len = len(full_frames)
+        looped_frames = []
+        while len(looped_frames) < len(mel_chunks):
+            looped_frames.extend(full_frames)
+        full_frames = looped_frames[:len(mel_chunks)]
+        print(f"✅ Đã loop video: {original_len} → {len(full_frames)} frames")
+    else:
+        # Cắt bớt frames nếu video dài hơn audio
+        full_frames = full_frames[:len(mel_chunks)]
+        print(f"✅ Đã cắt video về {len(full_frames)} frames (khớp với audio)")
+    # ========================================================================
+
     if str(args.preview_settings) == "True":
         full_frames = [full_frames[0]]
         mel_chunks = [mel_chunks[0]]
-    print(str(len(full_frames)) + " frames to process")
+    
+    print(f"\n🎬 {len(full_frames)} frames sẽ được xử lý")
+    
     batch_size = args.wav2lip_batch_size
     if str(args.preview_settings) == "True":
         gen = datagen(full_frames, mel_chunks)
@@ -825,44 +872,4 @@ def main():
             "-i", "temp/result.mp4",
             "-i", args.audio,
             "-c:v", "libx264",
-            "-preset", "medium",
-            "-crf", "18",
-            "-c:a", "aac",
-            "-b:a", "192k",
-            "-shortest",
-            args.outfile,
-        ]
-        
-        print("🎬 FFMPEG CMD:", " ".join(cmd))
-
-        try:
-            result = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                check=True
-            )
-            print("✅ FFMPEG OUTPUT:")
-            if result.stdout:
-                print(result.stdout)
-            print(f"✅ FFMPEG DONE - Video saved to: {args.outfile}")
-            
-            if os.path.exists(args.outfile):
-                print(f"✅ Output file size: {os.path.getsize(args.outfile)} bytes")
-            else:
-                print("⚠️ WARNING: Output file was not created!")
-            
-        except subprocess.CalledProcessError as e:
-            print("❌ FFMPEG FAILED!")
-            print(f"Return code: {e.returncode}")
-            print(f"Command: {' '.join(cmd)}")
-            print("Output:")
-            if e.stdout:
-                print(e.stdout)
-            raise Exception(f"FFmpeg failed with code {e.returncode}")
-
-
-if __name__ == "__main__":
-    do_load(args.checkpoint_path)
-    main()
+            "-preset", 

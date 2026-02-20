@@ -160,17 +160,37 @@ class Wav2LipEngine:
         )
     
     def _upscale(self, image):
-        """Upscale image với GFPGAN"""
+        """
+        Upscale image với GFPGAN.
+        
+        ĐÃ SỬA LỖI: Khi paste_back=False, GFPGAN.enhance() trả về:
+        - cropped_faces: list các mặt đã crop
+        - restored_faces: list các mặt đã restore (CẦN LẤY CÁI NÀY)
+        - restored_img: None (vì paste_back=False)
+        
+        Code cũ lấy restored_img (None) -> gây lỗi Dlib
+        Code mới lấy restored_faces[0] -> OK
+        """
         if self.sr_model is None:
             return image
         try:
-            _, _, output = self.sr_model.enhance(
+            # ============================================================
+            # FIX LỖI GFPGAN: Lấy restored_faces[0] thay vì restored_img
+            # ============================================================
+            _, restored_faces, _ = self.sr_model.enhance(
                 image,
                 has_aligned=True,
                 only_center_face=False,
                 paste_back=False
             )
-            return output
+            
+            # restored_faces là list, lấy phần tử đầu tiên
+            if restored_faces is not None and len(restored_faces) > 0:
+                return restored_faces[0]
+            else:
+                print("⚠️ GFPGAN returned empty restored_faces, using original")
+                return image
+                
         except Exception as e:
             print(f"⚠️ Upscale error: {e}")
             return image
@@ -400,8 +420,8 @@ class Wav2LipEngine:
         """
         # Default settings
         default_settings = {
-            'quality': 'Enhanced',      # Fast, Improved, Enhanced
-            'pads': [0, 10, 0, 0],       # top, bottom, left, right
+            'quality': 'Enhanced',
+            'pads': [0, 10, 0, 0],
             'nosmooth': False,
             'mouth_tracking': False,
             'mask_dilation': 150,
@@ -417,16 +437,14 @@ class Wav2LipEngine:
             'rotate': False,
             'debug_mask': False,
             'preview_settings': False,
-            'cache_file': None,         # Đường dẫn file cache face detection
+            'cache_file': None,
             'img_size': 96,
         }
         
-        # Merge settings
         if settings:
             default_settings.update(settings)
         s = default_settings
         
-        # Reset mask state
         self._reset_mask_state()
         
         print(f"\n🎬 Processing: {video_path}")
@@ -550,17 +568,14 @@ class Wav2LipEngine:
                     print(f"🎭 Mask: dilation={s['mask_dilation']}, feathering={s['mask_feathering']}")
                 print("🚀 Starting inference...")
             
-            # To tensor
             img_batch = torch.FloatTensor(np.transpose(img_batch, (0, 3, 1, 2))).to(self.device)
             mel_batch = torch.FloatTensor(np.transpose(mel_batch, (0, 3, 1, 2))).to(self.device)
             
-            # Inference
             with torch.no_grad():
                 pred = self.model(mel_batch, img_batch)
             
             pred = pred.cpu().numpy().transpose(0, 2, 3, 1) * 255.0
             
-            # Process predictions
             for p, f, c in zip(pred, frames, coords):
                 y1, y2, x1, x2 = c
                 
@@ -571,7 +586,9 @@ class Wav2LipEngine:
                 p = cv2.resize(p.astype(np.uint8), (x2 - x1, y2 - y1))
                 cf = f[y1:y2, x1:x2]
                 
-                # GFPGAN upscale
+                # ============================================================
+                # GFPGAN UPSCALE (ĐÃ SỬA LỖI - lấy restored_faces[0])
+                # ============================================================
                 if s['quality'] == "Enhanced" and self.sr_model:
                     p = self._upscale(p)
                 
@@ -651,23 +668,6 @@ def standalone_detect(video_path, target_frames=None, output_cache="face_cache.p
                       face_det_batch_size=16, loop_video=True):
     """
     Detect mặt và lưu cache độc lập.
-    Dùng để pre-cache face detection trước khi xử lý.
-    
-    Args:
-        video_path: Đường dẫn video
-        target_frames: Số frames cần detect (nếu None, dùng toàn bộ video)
-        output_cache: File .pkl để lưu cache
-        pads: Padding [top, bottom, left, right]
-        nosmooth: Không smooth boxes
-        out_height: Chiều cao output
-        fullres: Resize factor
-        crop: Crop region [y1, y2, x1, x2]
-        rotate: Xoay video 90 độ
-        face_det_batch_size: Batch size cho face detection
-        loop_video: Nếu True, loop video để đủ target_frames
-    
-    Returns:
-        str: Đường dẫn file cache
     """
     print(f"\n{'='*60}")
     print(f"🔍 STANDALONE FACE DETECTION")
@@ -676,7 +676,6 @@ def standalone_detect(video_path, target_frames=None, output_cache="face_cache.p
     print(f"🎯 Target frames: {target_frames or 'All'}")
     print(f"💾 Cache file: {output_cache}")
     
-    # Load detector
     gpu_id = 0 if torch.cuda.is_available() else -1
     detector = RetinaFace(
         gpu_id=gpu_id,
@@ -684,7 +683,6 @@ def standalone_detect(video_path, target_frames=None, output_cache="face_cache.p
         network="mobilenet"
     )
     
-    # Load video frames
     video_stream = cv2.VideoCapture(video_path)
     fps = video_stream.get(cv2.CAP_PROP_FPS)
     total_video_frames = int(video_stream.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -717,7 +715,6 @@ def standalone_detect(video_path, target_frames=None, output_cache="face_cache.p
     
     print(f"📹 Loaded {len(frames)} frames from video")
     
-    # Loop video nếu cần
     if target_frames and len(frames) < target_frames and loop_video:
         print(f"🔄 Looping video to reach {target_frames} frames...")
         original_frames = frames.copy()
@@ -726,7 +723,6 @@ def standalone_detect(video_path, target_frames=None, output_cache="face_cache.p
         frames = frames[:target_frames]
         print(f"📹 Extended to {len(frames)} frames")
     
-    # Detect faces
     results = []
     pady1, pady2, padx1, padx2 = pads
     
@@ -776,7 +772,6 @@ def standalone_detect(video_path, target_frames=None, output_cache="face_cache.p
         for image, (x1, y1, x2, y2) in zip(frames, boxes)
     ]
     
-    # Save cache
     with open(output_cache, "wb") as f:
         pickle.dump(final_results, f)
     
@@ -791,22 +786,15 @@ def standalone_detect(video_path, target_frames=None, output_cache="face_cache.p
 # ==============================================================================
 #                           LEGACY CLI SUPPORT
 # ==============================================================================
-# Giữ argparse cho backward compatibility với CLI cũ
-
 parser = argparse.ArgumentParser(
     description="Inference code to lip-sync videos using Wav2Lip models"
 )
 
-parser.add_argument("--checkpoint_path", type=str, required=True,
-                    help="Path to Wav2Lip checkpoint")
-parser.add_argument("--segmentation_path", type=str, 
-                    default="checkpoints/face_segmentation.pth")
-parser.add_argument("--face", type=str, required=True,
-                    help="Path to video/image with face")
-parser.add_argument("--audio", type=str, required=True,
-                    help="Path to audio file")
-parser.add_argument("--outfile", type=str, default="results/result_voice.mp4",
-                    help="Output video path")
+parser.add_argument("--checkpoint_path", type=str, required=True)
+parser.add_argument("--segmentation_path", type=str, default="checkpoints/face_segmentation.pth")
+parser.add_argument("--face", type=str, required=True)
+parser.add_argument("--audio", type=str, required=True)
+parser.add_argument("--outfile", type=str, default="results/result_voice.mp4")
 parser.add_argument("--static", type=bool, default=False)
 parser.add_argument("--fps", type=float, default=25.0)
 parser.add_argument("--pads", nargs="+", type=int, default=[0, 10, 0, 0])
@@ -834,7 +822,6 @@ def main():
     """Legacy main function cho CLI compatibility"""
     args = parser.parse_args()
     
-    # Tạo engine
     engine = Wav2LipEngine(
         gpu_id=0,
         checkpoint_path=args.checkpoint_path,
@@ -842,7 +829,6 @@ def main():
         sr_model_name=args.sr_model
     )
     
-    # Chuyển args thành settings dict
     settings = {
         'quality': args.quality,
         'pads': args.pads,
@@ -864,7 +850,6 @@ def main():
         'cache_file': "last_detected_face.pkl",
     }
     
-    # Process
     result = engine.process(args.face, args.audio, args.outfile, settings)
     
     if result:

@@ -97,7 +97,7 @@ parser.add_argument(
 parser.add_argument(
     "--outfile",
     type=str,
-    help="Video path to save result. See default for an e.g.",
+    help="Video path to save result.",
     default="results/result_voice.mp4",
 )
 
@@ -121,14 +121,14 @@ parser.add_argument(
     nargs="+",
     type=int,
     default=[0, 10, 0, 0],
-    help="Padding (top, bottom, left, right). Please adjust to include chin at least",
+    help="Padding (top, bottom, left, right).",
 )
 
 parser.add_argument(
     "--resize_factor",
     default=1,
     type=int,
-    help="Reduce the resolution by this factor. Sometimes needed for best results."
+    help="Reduce the resolution by this factor."
 )
 
 parser.add_argument(
@@ -149,7 +149,7 @@ parser.add_argument(
     "--out_height",
     default=480,
     type=int,
-    help="Output video height. Best results are obtained at 480 or 720",
+    help="Output video height.",
 )
 
 parser.add_argument(
@@ -157,7 +157,7 @@ parser.add_argument(
     nargs="+",
     type=int,
     default=[0, -1, 0, -1],
-    help="Crop video to a smaller region (top, bottom, left, right). Applied after resize_factor and rotate arg. Useful if multiple face present. -1 implies the value will be auto-inferred based on height, width",
+    help="Crop video to a smaller region.",
 )
 
 parser.add_argument(
@@ -165,21 +165,21 @@ parser.add_argument(
     nargs="+",
     type=int,
     default=[-1, -1, -1, -1],
-    help="Specify a constant bounding box for the face. Use only as a last resort if the face is not detected. Also, might work only if the face is not moving around much. Syntax: (top, bottom, left, right).",
+    help="Specify a constant bounding box for the face.",
 )
 
 parser.add_argument(
     "--rotate",
     default=False,
     action="store_true",
-    help="Sometimes videos taken from a phone can be flipped 90deg. If true, will flip video right by 90deg. Use if you get a flipped result, despite feeding a normal looking video",
+    help="Flip video right by 90deg.",
 )
 
 parser.add_argument(
     "--nosmooth",
     type=str,
     default=False,
-    help="Prevent smoothing face detections over a short temporal window",
+    help="Prevent smoothing face detections.",
 )
 
 parser.add_argument(
@@ -200,7 +200,7 @@ parser.add_argument(
     "--sr_model",
     type=str,
     default="gfpgan",
-    help="Name of upscaler - gfpgan or RestoreFormer",
+    help="Name of upscaler",
     required=False,
 )
 
@@ -208,14 +208,14 @@ parser.add_argument(
     "--fullres",
     default=3,
     type=int,
-    help="used only to determine if full res is used so that no resizing needs to be done if so",
+    help="Full resolution flag",
 )
 
 parser.add_argument(
     "--debug_mask",
     type=str,
     default=False,
-    help="Makes background grayscale to see the mask better",
+    help="Makes background grayscale",
 )
 
 parser.add_argument(
@@ -229,7 +229,7 @@ parser.add_argument(
     "--mouth_tracking",
     type=str,
     default=False,
-    help="Tracks the mouth in every frame for the mask",
+    help="Tracks the mouth in every frame",
 )
 
 parser.add_argument(
@@ -244,7 +244,7 @@ parser.add_argument(
     "--mask_feathering",
     default=151,
     type=int,
-    help="amount of feathering of mask around mouth",
+    help="amount of feathering of mask",
     required=False,
 )
 
@@ -258,14 +258,14 @@ parser.add_argument(
 parser.add_argument(
     "--only_detect",
     action="store_true",
-    help="Chi chay buoc tao cache mat va thoat, khong chay Wav2Lip."
+    help="Only create face cache and exit."
 )
 
 parser.add_argument(
     "--target_frames",
     type=int,
     default=0,
-    help="So luong frame muon tao cache (0 = lay tat ca frames cua video goc)."
+    help="Number of frames to create cache for."
 )
 
 args = parser.parse_args()
@@ -286,7 +286,6 @@ if not g_colab:
     preview_window = config.get('OPTIONS', 'preview_window')
 
 all_mouth_landmarks = []
-
 model = detector = detector_model = None
 
 
@@ -407,12 +406,18 @@ def get_smoothened_boxes(boxes, T):
     return boxes
 
 
+# ============================================================================
+# HAM FACE_DETECT - LUON DUNG CACHE NEU CO
+# ============================================================================
 def face_detect(images, results_file="last_detected_face.pkl"):
+    # Luon uu tien dung Cache neu file ton tai
     if os.path.exists(results_file):
-        print("Using face detection data from: " + results_file)
+        print("Loading face cache from: " + results_file)
         with open(results_file, "rb") as f:
             return pickle.load(f)
 
+    # Neu chua co Cache thi chay Detect moi
+    print("No cache found. Detecting faces...")
     results = []
     pady1, pady2, padx1, padx2 = args.pads
     
@@ -420,79 +425,71 @@ def face_detect(images, results_file="last_detected_face.pkl"):
     for image, rect in tqdm_partial(
         zip(images, face_rect(images)),
         total=len(images),
-        desc="detecting face in every frame",
-        ncols=100,
+        desc="detecting face",
+        ncols=100
     ):
         if rect is None:
             cv2.imwrite("temp/faulty_frame.jpg", image)
-            raise ValueError(
-                "Face not detected! Ensure the video contains a face in all the frames."
-            )
-
+            raise ValueError("Face not detected! Ensure the video contains a face.")
+        
         y1 = max(0, rect[1] - pady1)
         y2 = min(image.shape[0], rect[3] + pady2)
         x1 = max(0, rect[0] - padx1)
         x2 = min(image.shape[1], rect[2] + padx2)
-
         results.append([x1, y1, x2, y2])
 
     boxes = np.array(results)
     if str(args.nosmooth) == "False":
         boxes = get_smoothened_boxes(boxes, T=5)
+    
     results = [
         [image[y1:y2, x1:x2], (y1, y2, x1, x2)]
         for image, (x1, y1, x2, y2) in zip(images, boxes)
     ]
-
+    
+    # Luu Cache moi
     with open(results_file, "wb") as f:
         pickle.dump(results, f)
-
+    
+    print("Saved cache: " + str(len(results)) + " entries")
     return results
+# ============================================================================
 
 
+# ============================================================================
+# HAM DATAGEN - DONG BO THONG MINH BANG PHEP CHIA LAY DU
+# ============================================================================
 def datagen(frames, mels):
     img_batch, mel_batch, frame_batch, coords_batch = [], [], [], []
-    print("\r" + " " * 100, end="\r")
-    
+
+    # Lay du lieu mat (tu Cache hoac Detect moi)
     if args.box[0] == -1:
         if not args.static:
             face_det_results = face_detect(frames)
         else:
             face_det_results = face_detect([frames[0]])
     else:
-        print("Using the specified bounding box instead of face detection...")
+        print("Using specified bounding box...")
         y1, y2, x1, x2 = args.box
         face_det_results = [[f[y1:y2, x1:x2], (y1, y2, x1, x2)] for f in frames]
 
     num_frames = len(frames)
     num_cache = len(face_det_results)
     
-    if num_frames != num_cache:
-        print("\nSYNC MISMATCH DETECTED!")
-        print("Video frames: " + str(num_frames))
-        print("Cache entries: " + str(num_cache))
-        
-        min_len = min(num_frames, num_cache)
-        frames = frames[:min_len]
-        face_det_results = face_det_results[:min_len]
-        
-        print("FORCED ALIGNMENT: Cut to " + str(min_len) + " frames")
-    else:
-        print("Sync OK: " + str(num_frames) + " frames = " + str(num_cache) + " cache entries")
-    
-    num_synced_frames = len(frames)
-    print("Synced frames: " + str(num_synced_frames) + ", Mel chunks: " + str(len(mels)))
-    
+    print("SYNC: " + str(num_frames) + " video frames, " + str(num_cache) + " cache entries, " + str(len(mels)) + " mel chunks")
+
     for i, m in enumerate(mels):
-        if args.static:
-            idx = 0
-        else:
-            idx = i % num_synced_frames
+        # Tinh index cho Video (neu video ngan hon audio thi loop)
+        idx = 0 if args.static else i % num_frames
+        
+        # Tinh index cho Cache (dung idx cua video roi mod voi cache)
+        # Neu Cache ngan hon Video (do loop), no se tu quay vong
+        cache_idx = idx % num_cache
         
         frame_to_save = frames[idx].copy()
-        face, coords = face_det_results[idx]
-        face = face.copy()
-        face = cv2.resize(face, (args.img_size, args.img_size))
+        face, coords = face_det_results[cache_idx]
+        
+        face = cv2.resize(face.copy(), (args.img_size, args.img_size))
 
         img_batch.append(face)
         mel_batch.append(m)
@@ -515,6 +512,7 @@ def datagen(frames, mels):
         img_batch = np.concatenate((img_masked, img_batch), axis=3) / 255.0
         mel_batch = np.reshape(mel_batch, [len(mel_batch), mel_batch.shape[1], mel_batch.shape[2], 1])
         yield img_batch, mel_batch, frame_batch, coords_batch
+# ============================================================================
 
 
 mel_step_size = 16
@@ -558,7 +556,6 @@ def upscale(image, properties):
 
 def main():
     args.img_size = 96
-    frame_number = 11
 
     if os.path.isfile(args.face) and args.face.split(".")[1] in ["jpg", "png", "jpeg"]:
         args.static = True
@@ -601,47 +598,42 @@ def main():
 
     print("Loaded " + str(len(full_frames)) + " frames at " + str(fps) + " FPS")
 
+    # ========================================================================
+    # CHE DO CHI TAO CACHE
+    # ========================================================================
     if args.only_detect:
         target = args.target_frames if args.target_frames > 0 else len(full_frames)
         print("=" * 60)
-        print("CHE DO TAO CACHE DOC LAP")
+        print("CACHE CREATION MODE")
         print("=" * 60)
-        print("Video goc: " + str(len(full_frames)) + " frames | FPS: " + str(fps))
-        print("Target Cache: " + str(target) + " frames")
+        print("Original video: " + str(len(full_frames)) + " frames")
+        print("Target cache: " + str(target) + " frames")
         
         if target > len(full_frames):
-            print("Dang lap video de du " + str(target) + " frames...")
+            print("Looping video to reach " + str(target) + " frames...")
             looped_frames = []
             while len(looped_frames) < target:
                 looped_frames.extend(full_frames)
             full_frames = looped_frames[:target]
-            print("Da tao " + str(len(full_frames)) + " frames tu video loop")
+            print("Created " + str(len(full_frames)) + " frames from loop")
         else:
             full_frames = full_frames[:target]
-            print("Su dung " + str(len(full_frames)) + " frames dau tien")
-            
-        print("Bat dau Detect mat cho " + str(len(full_frames)) + " frames...")
+            print("Using first " + str(len(full_frames)) + " frames")
         
         cache_file = args.outfile if args.outfile.endswith('.pkl') else "master_cache.pkl"
         
         if os.path.exists(cache_file):
             os.remove(cache_file)
-            print("Da xoa cache cu: " + cache_file)
+            print("Deleted old cache: " + cache_file)
         
         face_detect(full_frames, results_file=cache_file)
         
         print("=" * 60)
-        print("DA TAO XONG CACHE!")
+        print("CACHE CREATED: " + cache_file)
+        print("Total entries: " + str(len(full_frames)))
         print("=" * 60)
-        print("File: " + cache_file)
-        print("So luong frames: " + str(len(full_frames)))
-        file_size = os.path.getsize(cache_file) / 1024
-        print("Kich thuoc file: " + str(round(file_size, 2)) + " KB")
-        duration = len(full_frames) / fps
-        print("Thoi luong tuong duong: " + str(round(duration, 2)) + " giay")
-        print("=" * 60)
-        
         return
+    # ========================================================================
 
     if not args.audio.endswith(".wav"):
         print("Converting audio to .wav")
@@ -651,12 +643,12 @@ def main():
         ])
         args.audio = "temp/temp.wav"
 
-    print("analysing audio...")
+    print("Analysing audio...")
     wav = audio.load_wav(args.audio, 16000)
     mel = audio.melspectrogram(wav)
 
     if np.isnan(mel.reshape(-1)).sum() > 0:
-        raise ValueError("Mel contains nan! Using a TTS voice? Add a small epsilon noise to the wav file and try again")
+        raise ValueError("Mel contains nan!")
 
     mel_chunks = []
     mel_idx_multiplier = 80.0 / fps
@@ -669,26 +661,30 @@ def main():
         mel_chunks.append(mel[:, start_idx : start_idx + mel_step_size])
         i += 1
 
-    print("Audio tao ra " + str(len(mel_chunks)) + " mel chunks")
-    print("Video co " + str(len(full_frames)) + " frames")
+    print("Audio: " + str(len(mel_chunks)) + " mel chunks")
+    print("Video: " + str(len(full_frames)) + " frames")
 
+    # ========================================================================
+    # LOOP VIDEO NEU AUDIO DAI HON
+    # ========================================================================
     if len(mel_chunks) > len(full_frames):
-        print("Audio dai hon video - Dang loop video...")
+        print("Audio longer than video - Looping video...")
         original_len = len(full_frames)
         looped_frames = []
         while len(looped_frames) < len(mel_chunks):
             looped_frames.extend(full_frames)
         full_frames = looped_frames[:len(mel_chunks)]
-        print("Da loop video: " + str(original_len) + " -> " + str(len(full_frames)) + " frames")
+        print("Looped: " + str(original_len) + " -> " + str(len(full_frames)) + " frames")
     else:
         full_frames = full_frames[:len(mel_chunks)]
-        print("Da cat video ve " + str(len(full_frames)) + " frames (khop voi audio)")
+        print("Trimmed to: " + str(len(full_frames)) + " frames")
+    # ========================================================================
 
     if str(args.preview_settings) == "True":
         full_frames = [full_frames[0]]
         mel_chunks = [mel_chunks[0]]
     
-    print(str(len(full_frames)) + " frames se duoc xu ly")
+    print("Processing " + str(len(full_frames)) + " frames...")
     
     batch_size = args.wav2lip_batch_size
     if str(args.preview_settings) == "True":
@@ -771,41 +767,32 @@ def main():
     out.release()
 
     if str(args.preview_settings) == "False":
-        print("converting to final video")
+        print("Converting to final video...")
 
         if not os.path.exists("temp/result.mp4"):
-            print("ERROR: temp/result.mp4 khong ton tai!")
-            print("Danh sach file trong temp/:")
-            try:
-                print(os.listdir("temp/"))
-            except Exception as e:
-                print("Khong the list thu muc temp/: " + str(e))
+            print("ERROR: temp/result.mp4 not found!")
             raise FileNotFoundError("temp/result.mp4 not found")
         
         if not os.path.exists(args.audio):
-            print("ERROR: Audio file khong ton tai: " + args.audio)
-            raise FileNotFoundError("Audio file not found: " + args.audio)
+            print("ERROR: Audio file not found: " + args.audio)
+            raise FileNotFoundError("Audio file not found")
 
-        print("temp/result.mp4 exists - Size: " + str(os.path.getsize("temp/result.mp4")) + " bytes")
-        print("Audio file exists: " + args.audio + " - Size: " + str(os.path.getsize(args.audio)) + " bytes")
+        print("temp/result.mp4 size: " + str(os.path.getsize("temp/result.mp4")) + " bytes")
 
         ffmpeg_cmd = "ffmpeg -y -i temp/result.mp4 -i " + args.audio + " -c:v libx264 -preset medium -crf 18 -c:a aac -b:a 192k -shortest " + args.outfile
         
-        print("FFMPEG CMD: " + ffmpeg_cmd)
+        print("FFMPEG: " + ffmpeg_cmd)
 
         try:
             subprocess.run(ffmpeg_cmd, shell=True, check=True)
-            print("FFMPEG DONE - Video saved to: " + args.outfile)
+            print("Done! Saved to: " + args.outfile)
             
             if os.path.exists(args.outfile):
-                print("Output file size: " + str(os.path.getsize(args.outfile)) + " bytes")
-            else:
-                print("WARNING: Output file was not created!")
+                print("Output size: " + str(os.path.getsize(args.outfile)) + " bytes")
             
         except subprocess.CalledProcessError as e:
-            print("FFMPEG FAILED!")
-            print("Return code: " + str(e.returncode))
-            raise Exception("FFmpeg failed with code " + str(e.returncode))
+            print("FFMPEG FAILED with code " + str(e.returncode))
+            raise
 
 
 if __name__ == "__main__":

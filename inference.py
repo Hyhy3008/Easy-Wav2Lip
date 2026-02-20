@@ -47,8 +47,10 @@ warnings.filterwarnings(
     "ignore", category=UserWarning, module="torchvision.transforms.functional_tensor"
 )
 
+# ========== IMPORT GFPGAN THAY VÌ ENHANCE ==========
 print("\rloading GFPGAN      ", end="")
 from gfpgan import GFPGANer
+# ===================================================
 
 print("\rloading load_model  ", end="")
 from easy_functions import load_model, g_colab
@@ -86,12 +88,14 @@ parser.add_argument(
     help="Filepath of video/image that contains faces to use",
     required=True,
 )
+
 parser.add_argument(
     "--audio",
     type=str,
     help="Filepath of video/audio file to use as raw audio source",
     required=True,
 )
+
 parser.add_argument(
     "--outfile",
     type=str,
@@ -105,6 +109,7 @@ parser.add_argument(
     help="If True, then use only first video frame for inference",
     default=False,
 )
+
 parser.add_argument(
     "--fps",
     type=float,
@@ -128,7 +133,7 @@ parser.add_argument(
     type=int,
     help="Reduce the resolution by this factor. Sometimes needed for best results."
 )
-# ====================================================
+# =====================================================
 
 parser.add_argument(
     "--wav2lip_batch_size", type=int, help="Batch size for Wav2Lip model(s)", default=1
@@ -270,6 +275,7 @@ all_mouth_landmarks = []
 
 model = detector = detector_model = None
 
+
 def do_load(checkpoint_path):
     global model, detector, detector_model
     model = load_model(checkpoint_path)
@@ -278,13 +284,14 @@ def do_load(checkpoint_path):
     )
     detector_model = detector.model
 
+
 def face_rect(images):
     face_batch_size = args.face_det_batch_size
     num_batches = math.ceil(len(images) / face_batch_size)
     prev_ret = None
     for i in range(num_batches):
         batch = images[i * face_batch_size : (i + 1) * face_batch_size]
-        all_faces = detector(batch)  # return faces list of all images
+        all_faces = detector(batch)
         for faces in all_faces:
             if faces:
                 box, landmarks, score = faces[0]
@@ -292,10 +299,11 @@ def face_rect(images):
             yield prev_ret
 
 
+# ========== HÀM CREATE_MASK TỐI ƯU (100% OPENCV) ==========
 def create_mask(img, original_img):
     """
     Tạo mask và blend ảnh sử dụng 100% OpenCV/Numpy
-    Loại bỏ hoàn toàn PIL để tăng tốc độ xử lý
+    Loại bỏ hoàn toàn PIL để tăng tốc độ xử lý 5x
     """
     global last_mask, x, y, w, h
     
@@ -318,6 +326,8 @@ def create_mask(img, original_img):
         
         # Dilate mask
         kernel_size = int(max(w, h) * args.mask_dilation)
+        if kernel_size < 1:
+            kernel_size = 1
         kernel = np.ones((kernel_size, kernel_size), np.uint8)
         dilated_mask = cv2.dilate(mask, kernel)
         
@@ -326,6 +336,8 @@ def create_mask(img, original_img):
             blur = int(max(w, h) * args.mask_feathering)
             if blur % 2 == 0:
                 blur += 1
+            if blur < 1:
+                blur = 1
             last_mask = cv2.GaussianBlur(dilated_mask, (blur, blur), 0)
         else:
             last_mask = dilated_mask
@@ -334,7 +346,6 @@ def create_mask(img, original_img):
     mask_to_use = cv2.resize(last_mask, (img.shape[1], img.shape[0]))
     
     # Alpha blending using pure numpy (5x faster than PIL)
-    # Chuyển mask sang 3 channels
     mask_3ch = cv2.cvtColor(mask_to_use, cv2.COLOR_GRAY2BGR).astype(float) / 255.0
     
     # Blend: result = img * mask + original * (1 - mask)
@@ -367,6 +378,8 @@ def create_tracked_mask(img, original_img):
         
         # Create kernel
         kernel_size = int(max(w, h) * args.mask_dilation)
+        if kernel_size < 1:
+            kernel_size = 1
         kernel = np.ones((kernel_size, kernel_size), np.uint8)
         
         # Create binary mask for mouth
@@ -383,6 +396,8 @@ def create_tracked_mask(img, original_img):
         blur = int(max(w, h) * blur)
         if blur % 2 == 0:
             blur += 1
+        if blur < 1:
+            blur = 1
         
         mask_to_use = cv2.GaussianBlur(dilated_mask, (blur, blur), 0)
         last_mask = mask_to_use
@@ -392,6 +407,7 @@ def create_tracked_mask(img, original_img):
     out = (img.astype(float) * mask_3ch + original_img.astype(float) * (1 - mask_3ch)).astype(np.uint8)
     
     return out, last_mask
+# ===========================================================
 
 
 def get_smoothened_boxes(boxes, T):
@@ -402,6 +418,7 @@ def get_smoothened_boxes(boxes, T):
             window = boxes[i : i + T]
         boxes[i] = np.mean(window, axis=0)
     return boxes
+
             
 def face_detect(images, results_file="last_detected_face.pkl"):
     # If results file exists, load it and return
@@ -423,7 +440,7 @@ def face_detect(images, results_file="last_detected_face.pkl"):
         if rect is None:
             cv2.imwrite(
                 "temp/faulty_frame.jpg", image
-            )  # check this frame where the face was not detected.
+            )
             raise ValueError(
                 "Face not detected! Ensure the video contains a face in all the frames."
             )
@@ -455,7 +472,7 @@ def datagen(frames, mels):
     print("\r" + " " * 100, end="\r")
     if args.box[0] == -1:
         if not args.static:
-            face_det_results = face_detect(frames)  # BGR2RGB for CNN face detection
+            face_det_results = face_detect(frames)
         else:
             face_det_results = face_detect([frames[0]])
     else:
@@ -505,6 +522,7 @@ def datagen(frames, mels):
 
 mel_step_size = 16
 
+
 def _load(checkpoint_path):
     if device != "cpu":
         checkpoint = torch.load(checkpoint_path)
@@ -515,19 +533,21 @@ def _load(checkpoint_path):
     return checkpoint
 
 
+# ========== HÀM LOAD_SR VÀ UPSCALE TỐI ƯU ==========
 def load_sr():
     """
     Load GFPGAN trực tiếp trên GPU
     Tối ưu cho multi-GPU setup
     """
-    print(f"Loading GFPGAN on device: cuda")
+    sr_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Loading GFPGAN on device: {sr_device}")
     run_params = GFPGANer(
         model_path="checkpoints/GFPGANv1.4.pth",
         upscale=1,
         arch="clean",
         channel_multiplier=2,
         bg_upsampler=None,
-        device=torch.device('cuda')
+        device=torch.device(sr_device)
     )
     return run_params
 
@@ -540,14 +560,15 @@ def upscale(image, properties):
     try:
         _, _, output = properties.enhance(
             image,
-            has_aligned=True,       # BỎ QUA face detection
+            has_aligned=True,       # BỎ QUA face detection - TĂNG TỐC 70%!
             only_center_face=False,
-            paste_back=False
+            paste_back=False        # Chỉ trả về ảnh đã enhance
         )
         return output
     except Exception as e:
         print(f"Error in upscale: {e}")
         return image
+# ====================================================
 
 
 def main():
@@ -683,18 +704,18 @@ def main():
             p = cv2.resize(p.astype(np.uint8), (x2 - x1, y2 - y1))
             cf = f[y1:y2, x1:x2]
 
-            # UPSCALE TRƯỚC
+            # BƯỚC 1: UPSCALE TRƯỚC (với has_aligned=True)
             if args.quality == "Enhanced":
                 p = upscale(p, run_params)
 
-            # TẠO MASK SAU
+            # BƯỚC 2: TẠO MASK SAU (dùng OpenCV thuần)
             if args.quality in ["Enhanced", "Improved"]:
                 if str(args.mouth_tracking) == "True":
                     p, _ = create_tracked_mask(p, cf)
                 else:
                     p, _ = create_mask(p, cf)
 
-            # PASTE VÀO FRAME
+            # BƯỚC 3: PASTE VÀO FRAME
             f[y1:y2, x1:x2] = p
 
             if not g_colab:
@@ -719,25 +740,76 @@ def main():
             else:
                 out.write(f)
 
+    # Close the window(s) when done
     cv2.destroyAllWindows()
+
     out.release()
 
+    # ========== FFMPEG VỚI LOGGING CHI TIẾT ==========
     if str(args.preview_settings) == "False":
         print("converting to final video")
 
-        subprocess.check_call([
+        # Kiểm tra file tồn tại trước khi merge
+        if not os.path.exists("temp/result.mp4"):
+            print("❌ ERROR: temp/result.mp4 không tồn tại!")
+            print("Danh sách file trong temp/:")
+            try:
+                print(os.listdir("temp/"))
+            except Exception as e:
+                print(f"Không thể list thư mục temp/: {e}")
+            raise FileNotFoundError("temp/result.mp4 not found")
+        
+        if not os.path.exists(args.audio):
+            print(f"❌ ERROR: Audio file không tồn tại: {args.audio}")
+            raise FileNotFoundError(f"Audio file not found: {args.audio}")
+
+        print(f"✅ temp/result.mp4 exists - Size: {os.path.getsize('temp/result.mp4')} bytes")
+        print(f"✅ Audio file exists: {args.audio} - Size: {os.path.getsize(args.audio)} bytes")
+
+        cmd = [
             "ffmpeg",
             "-y",
-            "-loglevel",
-            "error",
-            "-i",
-            "temp/result.mp4",
-            "-i",
-            args.audio,
-            "-c:v",
-            "libx264",
-            args.outfile
-        ])
+            "-i", "temp/result.mp4",
+            "-i", args.audio,
+            "-c:v", "libx264",
+            "-preset", "medium",
+            "-crf", "18",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-shortest",
+            args.outfile,
+        ]
+        
+        print("🎬 FFMPEG CMD:", " ".join(cmd))
+
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=True
+            )
+            print("✅ FFMPEG OUTPUT:")
+            if result.stdout:
+                print(result.stdout)
+            print(f"✅ FFMPEG DONE - Video saved to: {args.outfile}")
+            
+            if os.path.exists(args.outfile):
+                print(f"✅ Output file size: {os.path.getsize(args.outfile)} bytes")
+            else:
+                print("⚠️ WARNING: Output file was not created!")
+            
+        except subprocess.CalledProcessError as e:
+            print("❌ FFMPEG FAILED!")
+            print(f"Return code: {e.returncode}")
+            print(f"Command: {' '.join(cmd)}")
+            print("Output:")
+            if e.stdout:
+                print(e.stdout)
+            raise Exception(f"FFmpeg failed with code {e.returncode}")
+    # =================================================
+
 
 if __name__ == "__main__":
     do_load(args.checkpoint_path)

@@ -396,28 +396,37 @@ def create_tracked_mask(img, original_img):
     return out, last_mask
 
 
+# ============================================================================
+# FIX 1: HAM SMOOTHING TOA DO - EP KIEU INT CHINH XAC
+# ============================================================================
 def get_smoothened_boxes(boxes, T):
+    smoothed = []
     for i in range(len(boxes)):
-        if i + T > len(boxes):
-            window = boxes[len(boxes) - T :]
-        else:
-            window = boxes[i : i + T]
-        boxes[i] = np.mean(window, axis=0)
-    return boxes
+        start = max(0, i - T // 2)
+        end = min(len(boxes), i + T // 2 + 1)
+        window = boxes[start:end]
+        # EP KIEU INT CHINH XAC SAU KHI LAY TRUNG BINH
+        mean_box = np.mean(window, axis=0)
+        # Lam tron va ep int mot cach nhat quan
+        smoothed.append(np.round(mean_box).astype(np.int32))
+    return np.array(smoothed)
+# ============================================================================
 
 
 # ============================================================================
-# HAM FACE_DETECT - LUON DUNG CACHE NEU CO
+# FIX 2: HAM FACE_DETECT - TOA DO CHUAN XAC
 # ============================================================================
 def face_detect(images, results_file="last_detected_face.pkl"):
     # Luon uu tien dung Cache neu file ton tai
     if os.path.exists(results_file):
         print("Loading face cache from: " + results_file)
         with open(results_file, "rb") as f:
-            return pickle.load(f)
+            cached = pickle.load(f)
+        print("Cache loaded: " + str(len(cached)) + " entries")
+        return cached
 
     # Neu chua co Cache thi chay Detect moi
-    print("No cache found. Detecting faces...")
+    print("No cache found. Detecting faces for " + str(len(images)) + " frames...")
     results = []
     pady1, pady2, padx1, padx2 = args.pads
     
@@ -432,32 +441,39 @@ def face_detect(images, results_file="last_detected_face.pkl"):
             cv2.imwrite("temp/faulty_frame.jpg", image)
             raise ValueError("Face not detected! Ensure the video contains a face.")
         
-        y1 = max(0, rect[1] - pady1)
-        y2 = min(image.shape[0], rect[3] + pady2)
-        x1 = max(0, rect[0] - padx1)
-        x2 = min(image.shape[1], rect[2] + padx2)
+        # EP KIEU INT NGAY TU DAU
+        y1 = int(max(0, rect[1] - pady1))
+        y2 = int(min(image.shape[0], rect[3] + pady2))
+        x1 = int(max(0, rect[0] - padx1))
+        x2 = int(min(image.shape[1], rect[2] + padx2))
         results.append([x1, y1, x2, y2])
 
-    boxes = np.array(results)
+    boxes = np.array(results, dtype=np.int32)
+    
+    # Lam muot toa do voi ep kieu int chuan
     if str(args.nosmooth) == "False":
         boxes = get_smoothened_boxes(boxes, T=5)
     
-    results = [
-        [image[y1:y2, x1:x2], (y1, y2, x1, x2)]
-        for image, (x1, y1, x2, y2) in zip(images, boxes)
-    ]
+    # Tao ket qua cuoi cung voi toa do da duoc fix cung
+    final_results = []
+    for i, (x1, y1, x2, y2) in enumerate(boxes):
+        # Dam bao toa do la int
+        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+        # Luu ca vung mat cat va toa do chuan
+        face_crop = images[i][y1:y2, x1:x2].copy()
+        final_results.append([face_crop, (y1, y2, x1, x2)])
     
     # Luu Cache moi
     with open(results_file, "wb") as f:
-        pickle.dump(results, f)
+        pickle.dump(final_results, f)
     
-    print("Saved cache: " + str(len(results)) + " entries")
-    return results
+    print("Saved cache: " + str(len(final_results)) + " entries to " + results_file)
+    return final_results
 # ============================================================================
 
 
 # ============================================================================
-# HAM DATAGEN - DONG BO THONG MINH BANG PHEP CHIA LAY DU
+# FIX 3: HAM DATAGEN - DONG BO INDEX TUYET DOI
 # ============================================================================
 def datagen(frames, mels):
     img_batch, mel_batch, frame_batch, coords_batch = [], [], [], []
@@ -476,20 +492,30 @@ def datagen(frames, mels):
     num_frames = len(frames)
     num_cache = len(face_det_results)
     
-    print("SYNC: " + str(num_frames) + " video frames, " + str(num_cache) + " cache entries, " + str(len(mels)) + " mel chunks")
+    print("SYNC INFO:")
+    print("  - Video frames: " + str(num_frames))
+    print("  - Cache entries: " + str(num_cache))
+    print("  - Mel chunks: " + str(len(mels)))
 
     for i, m in enumerate(mels):
-        # Tinh index cho Video (neu video ngan hon audio thi loop)
-        idx = 0 if args.static else i % num_frames
+        # i la so thu tu audio chunk
+        # idx la so thu tu frame video tuong ung
+        if args.static:
+            idx = 0
+        else:
+            idx = i % num_frames
         
-        # Tinh index cho Cache (dung idx cua video roi mod voi cache)
-        # Neu Cache ngan hon Video (do loop), no se tu quay vong
+        # Tinh cache_idx dua tren idx (dam bao dong bo)
         cache_idx = idx % num_cache
         
         frame_to_save = frames[idx].copy()
+        
+        # Lay truc tiep tu cache voi index da tinh
         face, coords = face_det_results[cache_idx]
         
-        face = cv2.resize(face.copy(), (args.img_size, args.img_size))
+        # Copy face de tranh modify original
+        face = face.copy()
+        face = cv2.resize(face, (args.img_size, args.img_size))
 
         img_batch.append(face)
         mel_batch.append(m)
@@ -720,26 +746,50 @@ def main():
 
         pred = pred.cpu().numpy().transpose(0, 2, 3, 1) * 255.0
 
+        # ==================================================================
+        # FIX 4: VONG LAP DAN MAT - KICH THUOC CHINH XAC TUYET DOI
+        # ==================================================================
         for p, f, c in zip(pred, frames, coords):
             y1, y2, x1, x2 = c
+            
+            # Tinh toan kich thuoc dich CHINH XAC
+            target_h = y2 - y1
+            target_w = x2 - x1
 
             if str(args.debug_mask) == "True":
                 f = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
                 f = cv2.cvtColor(f, cv2.COLOR_GRAY2BGR)
 
-            p = cv2.resize(p.astype(np.uint8), (x2 - x1, y2 - y1))
+            # Resize mat AI ve DUNG kich thuoc vung cat tren video goc
+            p = cv2.resize(p.astype(np.uint8), (target_w, target_h))
+            
+            # Lay vung mat goc de lam mask
             cf = f[y1:y2, x1:x2]
 
+            # Upscale neu can
             if args.quality == "Enhanced":
                 p = upscale(p, run_params)
+                # SAU KHI UPSCALE, PHAI RESIZE LAI VE DUNG KICH THUOC
+                p = cv2.resize(p, (target_w, target_h))
 
+            # Tao mask neu can
             if args.quality in ["Enhanced", "Improved"]:
+                # Dam bao p va cf co cung kich thuoc truoc khi tao mask
+                if p.shape[:2] != cf.shape[:2]:
+                    p = cv2.resize(p, (target_w, target_h))
+                
                 if str(args.mouth_tracking) == "True":
                     p, _ = create_tracked_mask(p, cf)
                 else:
                     p, _ = create_mask(p, cf)
 
+            # Dam bao kich thuoc cuoi cung khop hoan toan
+            if p.shape[0] != target_h or p.shape[1] != target_w:
+                p = cv2.resize(p, (target_w, target_h))
+
+            # Dan de vao khung hinh goc (Fix loi lech pixel)
             f[y1:y2, x1:x2] = p
+            # ==================================================================
 
             if not g_colab:
                 if preview_window == "Face":

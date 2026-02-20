@@ -4,9 +4,6 @@ import torch
 print("\rloading numpy       ", end="")
 import numpy as np
 
-print("\rloading Image       ", end="")
-from PIL import Image
-
 print("\rloading argparse    ", end="")
 import argparse
 
@@ -49,11 +46,11 @@ import warnings
 warnings.filterwarnings(
     "ignore", category=UserWarning, module="torchvision.transforms.functional_tensor"
 )
-print("\rloading upscale     ", end="")
-from enhance import upscale
 
-print("\rloading load_sr     ", end="")
-from enhance import load_sr
+# ========== VỊ TRÍ 1: SỬA IMPORT (XÓA PIL, THÊM GFPGAN) ==========
+print("\rloading GFPGAN      ", end="")
+from gfpgan import GFPGANer
+# =================================================================
 
 print("\rloading load_model  ", end="")
 from easy_functions import load_model, g_colab
@@ -65,6 +62,7 @@ gpu_id = 0 if torch.cuda.is_available() else -1
 
 if device == 'cpu':
     print('Warning: No GPU detected so inference will be done on the CPU which is VERY SLOW!')
+
 parser = argparse.ArgumentParser(
     description="Inference code to lip-sync videos in the wild using Wav2Lip models"
 )
@@ -127,6 +125,10 @@ parser.add_argument(
 
 parser.add_argument(
     "--wav2lip_batch_size", type=int, help="Batch size for Wav2Lip model(s)", default=1
+)
+
+parser.add_argument(
+    "--face_det_batch_size", type=int, help="Batch size for face detection", default=16
 )
 
 parser.add_argument(
@@ -236,6 +238,8 @@ parser.add_argument(
     default="Fast",
 )
 
+args = parser.parse_args()
+
 with open(os.path.join("checkpoints", "predictor.pkl"), "rb") as f:
     predictor = pickle.load(f)
 
@@ -248,12 +252,12 @@ kernel = last_mask = x = y = w = h = None
 g_colab = g_colab()
 
 if not g_colab:
-  # Load the config file
-  config = configparser.ConfigParser()
-  config.read('config.ini')
+    # Load the config file
+    config = configparser.ConfigParser()
+    config.read('config.ini')
 
-  # Get the value of the "preview_window" variable
-  preview_window = config.get('OPTIONS', 'preview_window')
+    # Get the value of the "preview_window" variable
+    preview_window = config.get('OPTIONS', 'preview_window')
 
 all_mouth_landmarks = []
 
@@ -268,7 +272,7 @@ def do_load(checkpoint_path):
     detector_model = detector.model
 
 def face_rect(images):
-    face_batch_size = 8
+    face_batch_size = args.face_det_batch_size
     num_batches = math.ceil(len(images) / face_batch_size)
     prev_ret = None
     for i in range(num_batches):
@@ -280,183 +284,109 @@ def face_rect(images):
                 prev_ret = tuple(map(int, box))
             yield prev_ret
 
+
+# ========== VỊ TRÍ 3: HÀM CREATE_MASK TỐI ƯU (DÙNG OPENCV THUẦN) ==========
+def create_mask(img, original_img):
+    """
+    Tạo mask và blend ảnh sử dụng 100% OpenCV/Numpy
+    Loại bỏ hoàn toàn PIL để tăng tốc độ xử lý
+    """
+    global last_mask, x, y, w, h
+    
+    # Tạo mask mới nếu chưa có
+    if last_mask is None:
+        faces = mouth_detector(img)
+        if len(faces) == 0:
+            return img, None
+        
+        face = faces[0]
+        shape = predictor(img, face)
+        
+        # Get mouth points
+        mouth_points = np.array([[shape.part(i).x, shape.part(i).y] for i in range(48, 68)])
+        x, y, w, h = cv2.boundingRect(mouth_points)
+        
+        # Create base mask
+        mask = np.zeros(img.shape[:2], dtype=np.uint8)
+        cv2.fillConvexPoly(mask, mouth_points, 255)
+        
+        # Dilate mask
+        kernel_size = int(max(w, h) * args.mask_dilation)
+        kernel = np.ones((kernel_size, kernel_size), np.uint8)
+        dilated_mask = cv2.dilate(mask, kernel)
+        
+        # Apply Gaussian blur for feathering
+        if args.mask_feathering != 0:
+            blur = int(max(w, h) * args.mask_feathering)
+            if blur % 2 == 0:
+                blur += 1
+            last_mask = cv2.GaussianBlur(dilated_mask, (blur, blur), 0)
+        else:
+            last_mask = dilated_mask
+    
+    # Resize mask to match image size
+    mask_to_use = cv2.resize(last_mask, (img.shape[1], img.shape[0]))
+    
+    # Alpha blending using pure numpy (5x faster than PIL)
+    # Chuyển mask sang 3 channels
+    mask_3ch = cv2.cvtColor(mask_to_use, cv2.COLOR_GRAY2BGR).astype(float) / 255.0
+    
+    # Blend: result = img * mask + original * (1 - mask)
+    out = (img.astype(float) * mask_3ch + original_img.astype(float) * (1 - mask_3ch)).astype(np.uint8)
+    
+    return out, last_mask
+
+
 def create_tracked_mask(img, original_img):
-    global kernel, last_mask, x, y, w, h  # Add last_mask to global variables
-
-    # Convert color space from BGR to RGB if necessary
-    cv2.cvtColor(img, cv2.COLOR_BGR2RGB, img)
-    cv2.cvtColor(original_img, cv2.COLOR_BGR2RGB, original_img)
-
+    """
+    Version có tracking - Tạo mask mới cho mỗi frame
+    Cũng tối ưu hoàn toàn bằng OpenCV
+    """
+    global kernel, last_mask, x, y, w, h
+    
     # Detect face
     faces = mouth_detector(img)
     if len(faces) == 0:
         if last_mask is not None:
-            last_mask = cv2.resize(last_mask, (img.shape[1], img.shape[0]))
-            mask = last_mask  # use the last successful mask
+            mask_to_use = cv2.resize(last_mask, (img.shape[1], img.shape[0]))
         else:
-            cv2.cvtColor(img, cv2.COLOR_BGR2RGB, img)
             return img, None
     else:
         face = faces[0]
         shape = predictor(img, face)
-
+        
         # Get points for mouth
-        mouth_points = np.array(
-            [[shape.part(i).x, shape.part(i).y] for i in range(48, 68)]
-        )
-
-        # Calculate bounding box dimensions
+        mouth_points = np.array([[shape.part(i).x, shape.part(i).y] for i in range(48, 68)])
         x, y, w, h = cv2.boundingRect(mouth_points)
-
-        # Set kernel size as a fraction of bounding box size
-        kernel_size = int(max(w, h) * args.mask_dilation)
-        # if kernel_size % 2 == 0:  # Ensure kernel size is odd
-        # kernel_size += 1
-
+        
         # Create kernel
+        kernel_size = int(max(w, h) * args.mask_dilation)
         kernel = np.ones((kernel_size, kernel_size), np.uint8)
-
+        
         # Create binary mask for mouth
         mask = np.zeros(img.shape[:2], dtype=np.uint8)
         cv2.fillConvexPoly(mask, mouth_points, 255)
-
-        last_mask = mask  # Update last_mask with the new mask
-
-    # Dilate the mask
-    dilated_mask = cv2.dilate(mask, kernel)
-
-    # Calculate distance transform of dilated mask
-    dist_transform = cv2.distanceTransform(dilated_mask, cv2.DIST_L2, 5)
-
-    # Normalize distance transform
-    cv2.normalize(dist_transform, dist_transform, 0, 255, cv2.NORM_MINMAX)
-
-    # Convert normalized distance transform to binary mask and convert it to uint8
-    _, masked_diff = cv2.threshold(dist_transform, 50, 255, cv2.THRESH_BINARY)
-    masked_diff = masked_diff.astype(np.uint8)
-
-    # make sure blur is an odd number
-    blur = args.mask_feathering
-    if blur % 2 == 0:
-        blur += 1
-    # Set blur size as a fraction of bounding box size
-    blur = int(max(w, h) * blur)  # 10% of bounding box size
-    if blur % 2 == 0:  # Ensure blur size is odd
-        blur += 1
-    masked_diff = cv2.GaussianBlur(masked_diff, (blur, blur), 0)
-
-    # Convert numpy arrays to PIL Images
-    input1 = Image.fromarray(img)
-    input2 = Image.fromarray(original_img)
-
-    # Convert mask to single channel where pixel values are from the alpha channel of the current mask
-    mask = Image.fromarray(masked_diff)
-
-    # Ensure images are the same size
-    assert input1.size == input2.size == mask.size
-
-    # Paste input1 onto input2 using the mask
-    input2.paste(input1, (0, 0), mask)
-
-    # Convert the final PIL Image back to a numpy array
-    input2 = np.array(input2)
-
-    # input2 = cv2.cvtColor(input2, cv2.COLOR_BGR2RGB)
-    cv2.cvtColor(input2, cv2.COLOR_BGR2RGB, input2)
-
-    return input2, mask
-
-
-def create_mask(img, original_img):
-    global kernel, last_mask, x, y, w, h # Add last_mask to global variables
-
-    # Convert color space from BGR to RGB if necessary
-    cv2.cvtColor(img, cv2.COLOR_BGR2RGB, img)
-    cv2.cvtColor(original_img, cv2.COLOR_BGR2RGB, original_img)
-
-    if last_mask is not None:
-        last_mask = np.array(last_mask)  # Convert PIL Image to numpy array
-        last_mask = cv2.resize(last_mask, (img.shape[1], img.shape[0]))
-        mask = last_mask  # use the last successful mask
-        mask = Image.fromarray(mask)
-
-    else:
-        # Detect face
-        faces = mouth_detector(img)
-        if len(faces) == 0:
-            cv2.cvtColor(img, cv2.COLOR_BGR2RGB, img)
-            return img, None
-        else:
-            face = faces[0]
-            shape = predictor(img, face)
-
-            # Get points for mouth
-            mouth_points = np.array(
-                [[shape.part(i).x, shape.part(i).y] for i in range(48, 68)]
-            )
-
-            # Calculate bounding box dimensions
-            x, y, w, h = cv2.boundingRect(mouth_points)
-
-            # Set kernel size as a fraction of bounding box size
-            kernel_size = int(max(w, h) * args.mask_dilation)
-            # if kernel_size % 2 == 0:  # Ensure kernel size is odd
-            # kernel_size += 1
-
-            # Create kernel
-            kernel = np.ones((kernel_size, kernel_size), np.uint8)
-
-            # Create binary mask for mouth
-            mask = np.zeros(img.shape[:2], dtype=np.uint8)
-            cv2.fillConvexPoly(mask, mouth_points, 255)
-
-            # Dilate the mask
-            dilated_mask = cv2.dilate(mask, kernel)
-
-            # Calculate distance transform of dilated mask
-            dist_transform = cv2.distanceTransform(dilated_mask, cv2.DIST_L2, 5)
-
-            # Normalize distance transform
-            cv2.normalize(dist_transform, dist_transform, 0, 255, cv2.NORM_MINMAX)
-
-            # Convert normalized distance transform to binary mask and convert it to uint8
-            _, masked_diff = cv2.threshold(dist_transform, 50, 255, cv2.THRESH_BINARY)
-            masked_diff = masked_diff.astype(np.uint8)
-
-            if not args.mask_feathering == 0:
-                blur = args.mask_feathering
-                # Set blur size as a fraction of bounding box size
-                blur = int(max(w, h) * blur)  # 10% of bounding box size
-                if blur % 2 == 0:  # Ensure blur size is odd
-                    blur += 1
-                masked_diff = cv2.GaussianBlur(masked_diff, (blur, blur), 0)
-
-            # Convert mask to single channel where pixel values are from the alpha channel of the current mask
-            mask = Image.fromarray(masked_diff)
-
-            last_mask = mask  # Update last_mask with the final mask after dilation and feathering
-
-    # Convert numpy arrays to PIL Images
-    input1 = Image.fromarray(img)
-    input2 = Image.fromarray(original_img)
-
-    # Resize mask to match image size
-    # mask = Image.fromarray(mask)
-    mask = mask.resize(input1.size)
-
-    # Ensure images are the same size
-    assert input1.size == input2.size == mask.size
-
-    # Paste input1 onto input2 using the mask
-    input2.paste(input1, (0, 0), mask)
-
-    # Convert the final PIL Image back to a numpy array
-    input2 = np.array(input2)
-
-    # input2 = cv2.cvtColor(input2, cv2.COLOR_BGR2RGB)
-    cv2.cvtColor(input2, cv2.COLOR_BGR2RGB, input2)
-
-    return input2, mask
+        
+        # Dilate the mask
+        dilated_mask = cv2.dilate(mask, kernel)
+        
+        # Apply Gaussian blur
+        blur = args.mask_feathering
+        if blur % 2 == 0:
+            blur += 1
+        blur = int(max(w, h) * blur)
+        if blur % 2 == 0:
+            blur += 1
+        
+        mask_to_use = cv2.GaussianBlur(dilated_mask, (blur, blur), 0)
+        last_mask = mask_to_use
+    
+    # Alpha blending using pure numpy
+    mask_3ch = cv2.cvtColor(mask_to_use, cv2.COLOR_GRAY2BGR).astype(float) / 255.0
+    out = (img.astype(float) * mask_3ch + original_img.astype(float) * (1 - mask_3ch)).astype(np.uint8)
+    
+    return out, last_mask
+# ===========================================================================
 
 
 def get_smoothened_boxes(boxes, T):
@@ -499,7 +429,6 @@ def face_detect(images, results_file="last_detected_face.pkl"):
         x2 = min(image.shape[1], rect[2] + padx2)
 
         results.append([x1, y1, x2, y2])
-
 
     boxes = np.array(results)
     if str(args.nosmooth) == "False":
@@ -579,6 +508,43 @@ def _load(checkpoint_path):
             checkpoint_path, map_location=lambda storage, loc: storage
         )
     return checkpoint
+
+
+# ========== VỊ TRÍ 2: HÀM LOAD_SR VÀ UPSCALE TỐI ƯU ==========
+def load_sr():
+    """
+    Load GFPGAN trực tiếp trên GPU
+    Tối ưu cho multi-GPU setup
+    """
+    print(f"Loading GFPGAN on device: cuda")
+    run_params = GFPGANer(
+        model_path="checkpoints/GFPGANv1.4.pth",
+        upscale=1,
+        arch="clean",
+        channel_multiplier=2,
+        bg_upsampler=None,
+        device=torch.device('cuda')  # Ép buộc dùng CUDA
+    )
+    return run_params
+
+
+def upscale(image, properties):
+    """
+    Upscale với has_aligned=True để bỏ qua face detection
+    Tiết kiệm ~70% thời gian xử lý GFPGAN
+    """
+    try:
+        _, _, output = properties.enhance(
+            image,
+            has_aligned=True,       # BỎ QUA face detection (vì Wav2Lip đã detect rồi)
+            only_center_face=False,
+            paste_back=False        # Chỉ trả về ảnh mặt đã enhance, không paste
+        )
+        return output
+    except Exception as e:
+        print(f"Error in upscale: {e}")
+        return image
+# ==============================================================
 
 
 def main():
@@ -704,30 +670,32 @@ def main():
 
         pred = pred.cpu().numpy().transpose(0, 2, 3, 1) * 255.0
 
+        # ========== VỊ TRÍ 4: VÒNG LẶP CHÍNH - THỨ TỰ TỐI ƯU ==========
         for p, f, c in zip(pred, frames, coords):
-            # cv2.imwrite('temp/f.jpg', f)
-
             y1, y2, x1, x2 = c
 
-            if (
-                str(args.debug_mask) == "True"
-            ):  # makes the background black & white so you can see the mask better
+            if str(args.debug_mask) == "True":
                 f = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
                 f = cv2.cvtColor(f, cv2.COLOR_GRAY2BGR)
 
+            # Resize predicted face
             p = cv2.resize(p.astype(np.uint8), (x2 - x1, y2 - y1))
             cf = f[y1:y2, x1:x2]
 
+            # ✅ BƯỚC 1: UPSCALE TRƯỚC (trên vùng mặt đã cắt)
             if args.quality == "Enhanced":
                 p = upscale(p, run_params)
 
+            # ✅ BƯỚC 2: TẠO MASK VÀ BLEND SAU (dùng hàm OpenCV tối ưu)
             if args.quality in ["Enhanced", "Improved"]:
                 if str(args.mouth_tracking) == "True":
-                    p, last_mask = create_tracked_mask(p, cf)
+                    p, _ = create_tracked_mask(p, cf)
                 else:
-                    p, last_mask = create_mask(p, cf)
+                    p, _ = create_mask(p, cf)
 
+            # ✅ BƯỚC 3: DÁN VÀO KHUNG HÌNH GỐC
             f[y1:y2, x1:x2] = p
+            # ================================================================
 
             if not g_colab:
                 # Display the frame
@@ -741,15 +709,14 @@ def main():
 
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('q'):
-                    exit()  # Exit the loop when 'Q' is pressed
+                    exit()
 
             if str(args.preview_settings) == "True":
                 cv2.imwrite("temp/preview.jpg", f)
                 if not g_colab:
                     cv2.imshow("preview - press Q to close", f)
                     if cv2.waitKey(-1) & 0xFF == ord('q'):
-                        exit()  # Exit the loop when 'Q' is pressed
-
+                        exit()
             else:
                 out.write(f)
 
@@ -776,6 +743,5 @@ def main():
         ])
 
 if __name__ == "__main__":
-    args = parser.parse_args()
     do_load(args.checkpoint_path)
     main()

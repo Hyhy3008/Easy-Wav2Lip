@@ -483,7 +483,15 @@ def datagen(frames, mels):
     for i, m in enumerate(mels):
         idx = 0 if args.static else i % len(frames)
         frame_to_save = frames[idx].copy()
-        face, coords = face_det_results[idx].copy()
+
+        # ============================================================
+        # FIX LỖI PRE-CACHE (INDEX ERROR)
+        # Sử dụng modulo (%) để đảm bảo index luôn nằm trong phạm vi
+        # của cache. Nếu video loop dài hơn cache, nó sẽ tự động lấy
+        # lại tọa độ từ đầu cache thay vì crash với IndexError.
+        # ============================================================
+        safe_cache_idx = idx % len(face_det_results)
+        face, coords = face_det_results[safe_cache_idx].copy()
 
         face = cv2.resize(face, (args.img_size, args.img_size))
 

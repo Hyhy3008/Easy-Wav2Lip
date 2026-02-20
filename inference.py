@@ -47,10 +47,8 @@ warnings.filterwarnings(
     "ignore", category=UserWarning, module="torchvision.transforms.functional_tensor"
 )
 
-# ========== VỊ TRÍ 1: SỬA IMPORT (XÓA PIL, THÊM GFPGAN) ==========
 print("\rloading GFPGAN      ", end="")
 from gfpgan import GFPGANer
-# =================================================================
 
 print("\rloading load_model  ", end="")
 from easy_functions import load_model, g_colab
@@ -122,6 +120,15 @@ parser.add_argument(
     default=[0, 10, 0, 0],
     help="Padding (top, bottom, left, right). Please adjust to include chin at least",
 )
+
+# ========== FIX: THÊM THAM SỐ resize_factor ==========
+parser.add_argument(
+    "--resize_factor",
+    default=1,
+    type=int,
+    help="Reduce the resolution by this factor. Sometimes needed for best results."
+)
+# ====================================================
 
 parser.add_argument(
     "--wav2lip_batch_size", type=int, help="Batch size for Wav2Lip model(s)", default=1
@@ -285,7 +292,6 @@ def face_rect(images):
             yield prev_ret
 
 
-# ========== VỊ TRÍ 3: HÀM CREATE_MASK TỐI ƯU (DÙNG OPENCV THUẦN) ==========
 def create_mask(img, original_img):
     """
     Tạo mask và blend ảnh sử dụng 100% OpenCV/Numpy
@@ -386,7 +392,6 @@ def create_tracked_mask(img, original_img):
     out = (img.astype(float) * mask_3ch + original_img.astype(float) * (1 - mask_3ch)).astype(np.uint8)
     
     return out, last_mask
-# ===========================================================================
 
 
 def get_smoothened_boxes(boxes, T):
@@ -510,7 +515,6 @@ def _load(checkpoint_path):
     return checkpoint
 
 
-# ========== VỊ TRÍ 2: HÀM LOAD_SR VÀ UPSCALE TỐI ƯU ==========
 def load_sr():
     """
     Load GFPGAN trực tiếp trên GPU
@@ -523,7 +527,7 @@ def load_sr():
         arch="clean",
         channel_multiplier=2,
         bg_upsampler=None,
-        device=torch.device('cuda')  # Ép buộc dùng CUDA
+        device=torch.device('cuda')
     )
     return run_params
 
@@ -536,15 +540,14 @@ def upscale(image, properties):
     try:
         _, _, output = properties.enhance(
             image,
-            has_aligned=True,       # BỎ QUA face detection (vì Wav2Lip đã detect rồi)
+            has_aligned=True,       # BỎ QUA face detection
             only_center_face=False,
-            paste_back=False        # Chỉ trả về ảnh mặt đã enhance, không paste
+            paste_back=False
         )
         return output
     except Exception as e:
         print(f"Error in upscale: {e}")
         return image
-# ==============================================================
 
 
 def main():
@@ -670,7 +673,6 @@ def main():
 
         pred = pred.cpu().numpy().transpose(0, 2, 3, 1) * 255.0
 
-        # ========== VỊ TRÍ 4: VÒNG LẶP CHÍNH - THỨ TỰ TỐI ƯU ==========
         for p, f, c in zip(pred, frames, coords):
             y1, y2, x1, x2 = c
 
@@ -678,27 +680,24 @@ def main():
                 f = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
                 f = cv2.cvtColor(f, cv2.COLOR_GRAY2BGR)
 
-            # Resize predicted face
             p = cv2.resize(p.astype(np.uint8), (x2 - x1, y2 - y1))
             cf = f[y1:y2, x1:x2]
 
-            # ✅ BƯỚC 1: UPSCALE TRƯỚC (trên vùng mặt đã cắt)
+            # UPSCALE TRƯỚC
             if args.quality == "Enhanced":
                 p = upscale(p, run_params)
 
-            # ✅ BƯỚC 2: TẠO MASK VÀ BLEND SAU (dùng hàm OpenCV tối ưu)
+            # TẠO MASK SAU
             if args.quality in ["Enhanced", "Improved"]:
                 if str(args.mouth_tracking) == "True":
                     p, _ = create_tracked_mask(p, cf)
                 else:
                     p, _ = create_mask(p, cf)
 
-            # ✅ BƯỚC 3: DÁN VÀO KHUNG HÌNH GỐC
+            # PASTE VÀO FRAME
             f[y1:y2, x1:x2] = p
-            # ================================================================
 
             if not g_colab:
-                # Display the frame
                 if preview_window == "Face":
                     cv2.imshow("face preview - press Q to abort", p)
                 elif preview_window == "Full":
@@ -720,9 +719,7 @@ def main():
             else:
                 out.write(f)
 
-    # Close the window(s) when done
     cv2.destroyAllWindows()
-
     out.release()
 
     if str(args.preview_settings) == "False":

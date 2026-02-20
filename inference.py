@@ -126,14 +126,12 @@ parser.add_argument(
     help="Padding (top, bottom, left, right). Please adjust to include chin at least",
 )
 
-# ========== FIX: THÊM THAM SỐ resize_factor ==========
 parser.add_argument(
     "--resize_factor",
     default=1,
     type=int,
     help="Reduce the resolution by this factor. Sometimes needed for best results."
 )
-# =====================================================
 
 parser.add_argument(
     "--wav2lip_batch_size", type=int, help="Batch size for Wav2Lip model(s)", default=1
@@ -264,11 +262,8 @@ kernel = last_mask = x = y = w = h = None
 g_colab = g_colab()
 
 if not g_colab:
-    # Load the config file
     config = configparser.ConfigParser()
     config.read('config.ini')
-
-    # Get the value of the "preview_window" variable
     preview_window = config.get('OPTIONS', 'preview_window')
 
 all_mouth_landmarks = []
@@ -299,15 +294,9 @@ def face_rect(images):
             yield prev_ret
 
 
-# ========== HÀM CREATE_MASK TỐI ƯU (100% OPENCV) ==========
 def create_mask(img, original_img):
-    """
-    Tạo mask và blend ảnh sử dụng 100% OpenCV/Numpy
-    Loại bỏ hoàn toàn PIL để tăng tốc độ xử lý 5x
-    """
     global last_mask, x, y, w, h
     
-    # Tạo mask mới nếu chưa có
     if last_mask is None:
         faces = mouth_detector(img)
         if len(faces) == 0:
@@ -316,22 +305,18 @@ def create_mask(img, original_img):
         face = faces[0]
         shape = predictor(img, face)
         
-        # Get mouth points
         mouth_points = np.array([[shape.part(i).x, shape.part(i).y] for i in range(48, 68)])
         x, y, w, h = cv2.boundingRect(mouth_points)
         
-        # Create base mask
         mask = np.zeros(img.shape[:2], dtype=np.uint8)
         cv2.fillConvexPoly(mask, mouth_points, 255)
         
-        # Dilate mask
         kernel_size = int(max(w, h) * args.mask_dilation)
         if kernel_size < 1:
             kernel_size = 1
         kernel = np.ones((kernel_size, kernel_size), np.uint8)
         dilated_mask = cv2.dilate(mask, kernel)
         
-        # Apply Gaussian blur for feathering
         if args.mask_feathering != 0:
             blur = int(max(w, h) * args.mask_feathering)
             if blur % 2 == 0:
@@ -342,26 +327,16 @@ def create_mask(img, original_img):
         else:
             last_mask = dilated_mask
     
-    # Resize mask to match image size
     mask_to_use = cv2.resize(last_mask, (img.shape[1], img.shape[0]))
-    
-    # Alpha blending using pure numpy (5x faster than PIL)
     mask_3ch = cv2.cvtColor(mask_to_use, cv2.COLOR_GRAY2BGR).astype(float) / 255.0
-    
-    # Blend: result = img * mask + original * (1 - mask)
     out = (img.astype(float) * mask_3ch + original_img.astype(float) * (1 - mask_3ch)).astype(np.uint8)
     
     return out, last_mask
 
 
 def create_tracked_mask(img, original_img):
-    """
-    Version có tracking - Tạo mask mới cho mỗi frame
-    Cũng tối ưu hoàn toàn bằng OpenCV
-    """
     global kernel, last_mask, x, y, w, h
     
-    # Detect face
     faces = mouth_detector(img)
     if len(faces) == 0:
         if last_mask is not None:
@@ -372,24 +347,19 @@ def create_tracked_mask(img, original_img):
         face = faces[0]
         shape = predictor(img, face)
         
-        # Get points for mouth
         mouth_points = np.array([[shape.part(i).x, shape.part(i).y] for i in range(48, 68)])
         x, y, w, h = cv2.boundingRect(mouth_points)
         
-        # Create kernel
         kernel_size = int(max(w, h) * args.mask_dilation)
         if kernel_size < 1:
             kernel_size = 1
         kernel = np.ones((kernel_size, kernel_size), np.uint8)
         
-        # Create binary mask for mouth
         mask = np.zeros(img.shape[:2], dtype=np.uint8)
         cv2.fillConvexPoly(mask, mouth_points, 255)
         
-        # Dilate the mask
         dilated_mask = cv2.dilate(mask, kernel)
         
-        # Apply Gaussian blur
         blur = args.mask_feathering
         if blur % 2 == 0:
             blur += 1
@@ -402,12 +372,10 @@ def create_tracked_mask(img, original_img):
         mask_to_use = cv2.GaussianBlur(dilated_mask, (blur, blur), 0)
         last_mask = mask_to_use
     
-    # Alpha blending using pure numpy
     mask_3ch = cv2.cvtColor(mask_to_use, cv2.COLOR_GRAY2BGR).astype(float) / 255.0
     out = (img.astype(float) * mask_3ch + original_img.astype(float) * (1 - mask_3ch)).astype(np.uint8)
     
     return out, last_mask
-# ===========================================================
 
 
 def get_smoothened_boxes(boxes, T):
@@ -421,7 +389,6 @@ def get_smoothened_boxes(boxes, T):
 
             
 def face_detect(images, results_file="last_detected_face.pkl"):
-    # If results file exists, load it and return
     if os.path.exists(results_file):
         print("Using face detection data from last input")
         with open(results_file, "rb") as f:
@@ -438,9 +405,7 @@ def face_detect(images, results_file="last_detected_face.pkl"):
         ncols=100,
     ):
         if rect is None:
-            cv2.imwrite(
-                "temp/faulty_frame.jpg", image
-            )
+            cv2.imwrite("temp/faulty_frame.jpg", image)
             raise ValueError(
                 "Face not detected! Ensure the video contains a face in all the frames."
             )
@@ -460,7 +425,6 @@ def face_detect(images, results_file="last_detected_face.pkl"):
         for image, (x1, y1, x2, y2) in zip(images, boxes)
     ]
 
-    # Save results to file
     with open(results_file, "wb") as f:
         pickle.dump(results, f)
 
@@ -468,8 +432,15 @@ def face_detect(images, results_file="last_detected_face.pkl"):
 
 
 def datagen(frames, mels):
+    """
+    Generator để tạo batch data cho Wav2Lip inference.
+    
+    QUAN TRỌNG: Khi audio dài hơn video (loop), cả frame VÀ face_det_results
+    đều phải được lấy cùng một index để đảm bảo tọa độ mặt khớp với frame.
+    """
     img_batch, mel_batch, frame_batch, coords_batch = [], [], [], []
     print("\r" + " " * 100, end="\r")
+    
     if args.box[0] == -1:
         if not args.static:
             face_det_results = face_detect(frames)
@@ -480,18 +451,38 @@ def datagen(frames, mels):
         y1, y2, x1, x2 = args.box
         face_det_results = [[f[y1:y2, x1:x2], (y1, y2, x1, x2)] for f in frames]
 
+    # ================================================================
+    # FIX CHÍNH: Đồng bộ frame và cache cùng một index
+    # ================================================================
+    # Số lượng frames gốc (cũng = số lượng cache entries)
+    num_original_frames = len(frames)
+    num_cache_entries = len(face_det_results)
+    
+    # Log để debug
+    print(f"Original frames: {num_original_frames}, Cache entries: {num_cache_entries}, Mel chunks: {len(mels)}")
+    
     for i, m in enumerate(mels):
-        idx = 0 if args.static else i % len(frames)
+        if args.static:
+            # Static mode: luôn dùng frame đầu tiên
+            idx = 0
+        else:
+            # Video mode: quay vòng cả frame VÀ cache cùng lúc
+            # Đảm bảo frame và cache luôn khớp nhau
+            idx = i % num_original_frames
+        
         frame_to_save = frames[idx].copy()
-
+        
         # ============================================================
-        # FIX LỖI PRE-CACHE (INDEX ERROR)
-        # Sử dụng modulo (%) để đảm bảo index luôn nằm trong phạm vi
-        # của cache. Nếu video loop dài hơn cache, nó sẽ tự động lấy
-        # lại tọa độ từ đầu cache thay vì crash với IndexError.
+        # CRITICAL FIX: idx đã được tính toán để nằm trong phạm vi
+        # của cả frames VÀ face_det_results (vì chúng có cùng length)
+        # 
+        # Nếu vì lý do nào đó cache ngắn hơn frames, dùng min()
+        # để đảm bảo an toàn, nhưng vẫn giữ sự đồng bộ
         # ============================================================
-        safe_cache_idx = idx % len(face_det_results)
-        face, coords = face_det_results[safe_cache_idx].copy()
+        cache_idx = idx % num_cache_entries  # An toàn khi cache = frames
+        
+        # Lấy face và coords từ cache
+        face, coords = face_det_results[cache_idx].copy()
 
         face = cv2.resize(face, (args.img_size, args.img_size))
 
@@ -541,12 +532,7 @@ def _load(checkpoint_path):
     return checkpoint
 
 
-# ========== HÀM LOAD_SR VÀ UPSCALE TỐI ƯU ==========
 def load_sr():
-    """
-    Load GFPGAN trực tiếp trên GPU
-    Tối ưu cho multi-GPU setup
-    """
     sr_device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Loading GFPGAN on device: {sr_device}")
     run_params = GFPGANer(
@@ -561,22 +547,17 @@ def load_sr():
 
 
 def upscale(image, properties):
-    """
-    Upscale với has_aligned=True để bỏ qua face detection
-    Tiết kiệm ~70% thời gian xử lý GFPGAN
-    """
     try:
         _, _, output = properties.enhance(
             image,
-            has_aligned=True,       # BỎ QUA face detection - TĂNG TỐC 70%!
+            has_aligned=True,
             only_center_face=False,
-            paste_back=False        # Chỉ trả về ảnh đã enhance
+            paste_back=False
         )
         return output
     except Exception as e:
         print(f"Error in upscale: {e}")
         return image
-# ====================================================
 
 
 def main():
@@ -712,18 +693,15 @@ def main():
             p = cv2.resize(p.astype(np.uint8), (x2 - x1, y2 - y1))
             cf = f[y1:y2, x1:x2]
 
-            # BƯỚC 1: UPSCALE TRƯỚC (với has_aligned=True)
             if args.quality == "Enhanced":
                 p = upscale(p, run_params)
 
-            # BƯỚC 2: TẠO MASK SAU (dùng OpenCV thuần)
             if args.quality in ["Enhanced", "Improved"]:
                 if str(args.mouth_tracking) == "True":
                     p, _ = create_tracked_mask(p, cf)
                 else:
                     p, _ = create_mask(p, cf)
 
-            # BƯỚC 3: PASTE VÀO FRAME
             f[y1:y2, x1:x2] = p
 
             if not g_colab:
@@ -748,16 +726,12 @@ def main():
             else:
                 out.write(f)
 
-    # Close the window(s) when done
     cv2.destroyAllWindows()
-
     out.release()
 
-    # ========== FFMPEG VỚI LOGGING CHI TIẾT ==========
     if str(args.preview_settings) == "False":
         print("converting to final video")
 
-        # Kiểm tra file tồn tại trước khi merge
         if not os.path.exists("temp/result.mp4"):
             print("❌ ERROR: temp/result.mp4 không tồn tại!")
             print("Danh sách file trong temp/:")
@@ -816,7 +790,6 @@ def main():
             if e.stdout:
                 print(e.stdout)
             raise Exception(f"FFmpeg failed with code {e.returncode}")
-    # =================================================
 
 
 if __name__ == "__main__":

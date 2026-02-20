@@ -47,10 +47,8 @@ warnings.filterwarnings(
     "ignore", category=UserWarning, module="torchvision.transforms.functional_tensor"
 )
 
-# ========== IMPORT GFPGAN THAY VÌ ENHANCE ==========
 print("\rloading GFPGAN      ", end="")
 from gfpgan import GFPGANer
-# ===================================================
 
 print("\rloading load_model  ", end="")
 from easy_functions import load_model, g_colab
@@ -134,11 +132,17 @@ parser.add_argument(
 )
 
 parser.add_argument(
-    "--wav2lip_batch_size", type=int, help="Batch size for Wav2Lip model(s)", default=1
+    "--wav2lip_batch_size",
+    type=int,
+    help="Batch size for Wav2Lip model(s)",
+    default=1
 )
 
 parser.add_argument(
-    "--face_det_batch_size", type=int, help="Batch size for face detection", default=16
+    "--face_det_batch_size",
+    type=int,
+    help="Batch size for face detection",
+    default=16
 )
 
 parser.add_argument(
@@ -153,8 +157,7 @@ parser.add_argument(
     nargs="+",
     type=int,
     default=[0, -1, 0, -1],
-    help="Crop video to a smaller region (top, bottom, left, right). Applied after resize_factor and rotate arg. "
-    "Useful if multiple face present. -1 implies the value will be auto-inferred based on height, width",
+    help="Crop video to a smaller region (top, bottom, left, right). Applied after resize_factor and rotate arg. Useful if multiple face present. -1 implies the value will be auto-inferred based on height, width",
 )
 
 parser.add_argument(
@@ -162,16 +165,14 @@ parser.add_argument(
     nargs="+",
     type=int,
     default=[-1, -1, -1, -1],
-    help="Specify a constant bounding box for the face. Use only as a last resort if the face is not detected."
-    "Also, might work only if the face is not moving around much. Syntax: (top, bottom, left, right).",
+    help="Specify a constant bounding box for the face. Use only as a last resort if the face is not detected. Also, might work only if the face is not moving around much. Syntax: (top, bottom, left, right).",
 )
 
 parser.add_argument(
     "--rotate",
     default=False,
     action="store_true",
-    help="Sometimes videos taken from a phone can be flipped 90deg. If true, will flip video right by 90deg."
-    "Use if you get a flipped result, despite feeding a normal looking video",
+    help="Sometimes videos taken from a phone can be flipped 90deg. If true, will flip video right by 90deg. Use if you get a flipped result, despite feeding a normal looking video",
 )
 
 parser.add_argument(
@@ -189,7 +190,10 @@ parser.add_argument(
 )
 
 parser.add_argument(
-    "--no_sr", default=False, action="store_true", help="Prevent using super resolution"
+    "--no_sr",
+    default=False,
+    action="store_true",
+    help="Prevent using super resolution"
 )
 
 parser.add_argument(
@@ -215,7 +219,10 @@ parser.add_argument(
 )
 
 parser.add_argument(
-    "--preview_settings", type=str, default=False, help="Processes only one frame"
+    "--preview_settings",
+    type=str,
+    default=False,
+    help="Processes only one frame"
 )
 
 parser.add_argument(
@@ -248,22 +255,18 @@ parser.add_argument(
     default="Fast",
 )
 
-# ========================================================================
-# THAM SỐ MỚI: CHẾ ĐỘ CHỈ TẠO CACHE
-# ========================================================================
 parser.add_argument(
-    "--only_detect", 
-    action="store_true", 
-    help="Chỉ chạy bước tạo cache mặt và thoát, không chạy Wav2Lip."
+    "--only_detect",
+    action="store_true",
+    help="Chi chay buoc tao cache mat va thoat, khong chay Wav2Lip."
 )
 
 parser.add_argument(
-    "--target_frames", 
-    type=int, 
-    default=0, 
-    help="Số lượng frame muốn tạo cache (0 = lấy tất cả frames của video gốc)."
+    "--target_frames",
+    type=int,
+    default=0,
+    help="So luong frame muon tao cache (0 = lay tat ca frames cua video goc)."
 )
-# ========================================================================
 
 args = parser.parse_args()
 
@@ -273,7 +276,6 @@ with open(os.path.join("checkpoints", "predictor.pkl"), "rb") as f:
 with open(os.path.join("checkpoints", "mouth_detector.pkl"), "rb") as f:
     mouth_detector = pickle.load(f)
 
-# creating variables to prevent failing when a face isn't detected
 kernel = last_mask = x = y = w = h = None
 
 g_colab = g_colab()
@@ -404,10 +406,10 @@ def get_smoothened_boxes(boxes, T):
         boxes[i] = np.mean(window, axis=0)
     return boxes
 
-            
+
 def face_detect(images, results_file="last_detected_face.pkl"):
     if os.path.exists(results_file):
-        print(f"Using face detection data from: {results_file}")
+        print("Using face detection data from: " + results_file)
         with open(results_file, "rb") as f:
             return pickle.load(f)
 
@@ -415,7 +417,7 @@ def face_detect(images, results_file="last_detected_face.pkl"):
     pady1, pady2, padx1, padx2 = args.pads
     
     tqdm_partial = partial(tqdm, position=0, leave=True)
-    for image, (rect) in tqdm_partial(
+    for image, rect in tqdm_partial(
         zip(images, face_rect(images)),
         total=len(images),
         desc="detecting face in every frame",
@@ -448,21 +450,10 @@ def face_detect(images, results_file="last_detected_face.pkl"):
     return results
 
 
-# ========================================================================
-# HÀM DATAGEN ĐÃ SỬA - FIX LỖI LỆCH MẶT (SYNC FIX)
-# ========================================================================
 def datagen(frames, mels):
-    """
-    Generator để tạo batch data cho Wav2Lip inference.
-    
-    🔧 ĐÃ SỬA: Đồng bộ hoàn hảo giữa frames và face_det_results
-    - Ép buộc len(frames) == len(face_det_results)
-    - Chỉ dùng 1 index duy nhất cho cả hai
-    """
     img_batch, mel_batch, frame_batch, coords_batch = [], [], [], []
     print("\r" + " " * 100, end="\r")
     
-    # === BƯỚC 1: LẤY FACE DETECTION RESULTS ===
     if args.box[0] == -1:
         if not args.static:
             face_det_results = face_detect(frames)
@@ -473,56 +464,34 @@ def datagen(frames, mels):
         y1, y2, x1, x2 = args.box
         face_det_results = [[f[y1:y2, x1:x2], (y1, y2, x1, x2)] for f in frames]
 
-    # ========================================================================
-    # 🔧 SYNC FIX: ÉP BUỘC ĐỒNG BỘ FRAMES VÀ CACHE
-    # ========================================================================
     num_frames = len(frames)
     num_cache = len(face_det_results)
     
     if num_frames != num_cache:
-        print(f"\n⚠️  SYNC MISMATCH DETECTED!")
-        print(f"    Video frames: {num_frames}")
-        print(f"    Cache entries: {num_cache}")
+        print("\nSYNC MISMATCH DETECTED!")
+        print("Video frames: " + str(num_frames))
+        print("Cache entries: " + str(num_cache))
         
-        # Lấy số nhỏ hơn để cắt bớt phần thừa
         min_len = min(num_frames, num_cache)
-        
-        # Cắt cả hai danh sách về cùng độ dài
         frames = frames[:min_len]
         face_det_results = face_det_results[:min_len]
         
-        print(f"✅  FORCED ALIGNMENT: Cắt về {min_len} frames")
-        print(f"    → Perfect sync guaranteed!\n")
+        print("FORCED ALIGNMENT: Cut to " + str(min_len) + " frames")
     else:
-        print(f"✅ Sync OK: {num_frames} frames = {num_cache} cache entries")
+        print("Sync OK: " + str(num_frames) + " frames = " + str(num_cache) + " cache entries")
     
-    # Số lượng frame sau khi đã đồng bộ
     num_synced_frames = len(frames)
-    # ========================================================================
-
-    print(f"📊 Synced frames: {num_synced_frames}, Mel chunks: {len(mels)}")
+    print("Synced frames: " + str(num_synced_frames) + ", Mel chunks: " + str(len(mels)))
     
     for i, m in enumerate(mels):
         if args.static:
-            # Static mode: luôn dùng frame đầu tiên
             idx = 0
         else:
-            # ================================================================
-            # 🔧 CRITICAL FIX: CHỈ DÙNG 1 INDEX DUY NHẤT
-            # Vì frames và face_det_results đã được đồng bộ ở trên
-            # idx này dùng cho CẢ HAI, không tính toán riêng nữa
-            # ================================================================
             idx = i % num_synced_frames
         
         frame_to_save = frames[idx].copy()
-        
-        # ================================================================
-        # 🔧 DÙNG CHUNG idx CHO CẢ FRAME VÀ CACHE
-        # Không còn cache_idx riêng nữa!
-        # ================================================================
         face, coords = face_det_results[idx]
-        face = face.copy()  # Tạo bản sao để tránh modify original
-
+        face = face.copy()
         face = cv2.resize(face, (args.img_size, args.img_size))
 
         img_batch.append(face)
@@ -532,31 +501,20 @@ def datagen(frames, mels):
 
         if len(img_batch) >= args.wav2lip_batch_size:
             img_batch, mel_batch = np.asarray(img_batch), np.asarray(mel_batch)
-
             img_masked = img_batch.copy()
             img_masked[:, args.img_size // 2 :] = 0
-
             img_batch = np.concatenate((img_masked, img_batch), axis=3) / 255.0
-            mel_batch = np.reshape(
-                mel_batch, [len(mel_batch), mel_batch.shape[1], mel_batch.shape[2], 1]
-            )
-
+            mel_batch = np.reshape(mel_batch, [len(mel_batch), mel_batch.shape[1], mel_batch.shape[2], 1])
             yield img_batch, mel_batch, frame_batch, coords_batch
             img_batch, mel_batch, frame_batch, coords_batch = [], [], [], []
 
     if len(img_batch) > 0:
         img_batch, mel_batch = np.asarray(img_batch), np.asarray(mel_batch)
-
         img_masked = img_batch.copy()
         img_masked[:, args.img_size // 2 :] = 0
-
         img_batch = np.concatenate((img_masked, img_batch), axis=3) / 255.0
-        mel_batch = np.reshape(
-            mel_batch, [len(mel_batch), mel_batch.shape[1], mel_batch.shape[2], 1]
-        )
-
+        mel_batch = np.reshape(mel_batch, [len(mel_batch), mel_batch.shape[1], mel_batch.shape[2], 1])
         yield img_batch, mel_batch, frame_batch, coords_batch
-# ========================================================================
 
 
 mel_step_size = 16
@@ -566,15 +524,13 @@ def _load(checkpoint_path):
     if device != "cpu":
         checkpoint = torch.load(checkpoint_path)
     else:
-        checkpoint = torch.load(
-            checkpoint_path, map_location=lambda storage, loc: storage
-        )
+        checkpoint = torch.load(checkpoint_path, map_location=lambda storage, loc: storage)
     return checkpoint
 
 
 def load_sr():
     sr_device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Loading GFPGAN on device: {sr_device}")
+    print("Loading GFPGAN on device: " + sr_device)
     run_params = GFPGANer(
         model_path="checkpoints/GFPGANv1.4.pth",
         upscale=1,
@@ -586,24 +542,18 @@ def load_sr():
     return run_params
 
 
-# ========================================================================
-# HÀM UPSCALE ĐÃ SỬA - FIX LỖI GFPGAN TRẢ VỀ NONE
-# ========================================================================
 def upscale(image, properties):
     try:
-        # ✅ FIX: Lấy giá trị thứ 2 (restored_faces) vì giá trị thứ 3 là None khi paste_back=False
         _, restored_faces, _ = properties.enhance(
             image,
             has_aligned=True,
             only_center_face=False,
             paste_back=False
         )
-        # ✅ Trả về khuôn mặt đã khôi phục đầu tiên
         return restored_faces[0]
     except Exception as e:
-        print(f"⚠️ Error in upscale: {e}")
-        return image  # Trả về ảnh gốc nếu lỗi
-# ========================================================================
+        print("Error in upscale: " + str(e))
+        return image
 
 
 def main():
@@ -627,7 +577,7 @@ def main():
         fps = video_stream.get(cv2.CAP_PROP_FPS)
 
         full_frames = []
-        while 1:
+        while True:
             still_reading, frame = video_stream.read()
             if not still_reading:
                 video_stream.release()
@@ -635,9 +585,7 @@ def main():
 
             if args.fullres != 1:
                 aspect_ratio = frame.shape[1] / frame.shape[0]
-                frame = cv2.resize(
-                    frame, (int(args.out_height * aspect_ratio), args.out_height)
-                )
+                frame = cv2.resize(frame, (int(args.out_height * aspect_ratio), args.out_height))
 
             if args.rotate:
                 frame = cv2.rotate(frame, cv2.cv2.ROTATE_90_CLOCKWISE)
@@ -649,72 +597,58 @@ def main():
                 y2 = frame.shape[0]
 
             frame = frame[y1:y2, x1:x2]
-
             full_frames.append(frame)
 
-    print(f"📹 Loaded {len(full_frames)} frames at {fps} FPS")
+    print("Loaded " + str(len(full_frames)) + " frames at " + str(fps) + " FPS")
 
-    # ========================================================================
-    # CHẾ ĐỘ CHỈ TẠO CACHE (ONLY DETECT) - Không chạy Wav2Lip
-    # ========================================================================
     if args.only_detect:
         target = args.target_frames if args.target_frames > 0 else len(full_frames)
-        print(f"\n{'='*60}")
-        print(f"🎯 CHẾ ĐỘ TẠO CACHE ĐỘC LẬP")
-        print(f"{'='*60}")
-        print(f"📊 Video gốc: {len(full_frames)} frames | FPS: {fps}")
-        print(f"🎯 Target Cache: {target} frames")
+        print("=" * 60)
+        print("CHE DO TAO CACHE DOC LAP")
+        print("=" * 60)
+        print("Video goc: " + str(len(full_frames)) + " frames | FPS: " + str(fps))
+        print("Target Cache: " + str(target) + " frames")
         
-        # ✅ Tự động Loop video nếu thiếu frame
         if target > len(full_frames):
-            print(f"\n🔄 Đang lặp video để đủ {target} frames...")
+            print("Dang lap video de du " + str(target) + " frames...")
             looped_frames = []
             while len(looped_frames) < target:
                 looped_frames.extend(full_frames)
             full_frames = looped_frames[:target]
-            print(f"✅ Đã tạo {len(full_frames)} frames từ video loop")
+            print("Da tao " + str(len(full_frames)) + " frames tu video loop")
         else:
             full_frames = full_frames[:target]
-            print(f"✅ Sử dụng {len(full_frames)} frames đầu tiên")
+            print("Su dung " + str(len(full_frames)) + " frames dau tien")
             
-        print(f"\n🔍 Bắt đầu Detect mặt cho {len(full_frames)} frames...")
+        print("Bat dau Detect mat cho " + str(len(full_frames)) + " frames...")
         
-        # Quyết định tên file cache
         cache_file = args.outfile if args.outfile.endswith('.pkl') else "master_cache.pkl"
         
-        # Xóa cache cũ nếu tồn tại để tạo mới
         if os.path.exists(cache_file):
             os.remove(cache_file)
-            print(f"🗑️ Đã xóa cache cũ: {cache_file}")
+            print("Da xoa cache cu: " + cache_file)
         
-        # Chạy face detection và lưu cache
         face_detect(full_frames, results_file=cache_file)
         
-        print(f"\n{'='*60}")
-        print(f"✅ ĐÃ TẠO XONG CACHE!")
-        print(f"{'='*60}")
-        print(f"📁 File: {cache_file}")
-        print(f"📊 Số lượng frames: {len(full_frames)}")
-        print(f"💾 Kích thước file: {os.path.getsize(cache_file) / 1024:.2f} KB")
-        print(f"⏱️ Thời lượng tương đương: {len(full_frames) / fps:.2f} giây")
-        print(f"{'='*60}\n")
+        print("=" * 60)
+        print("DA TAO XONG CACHE!")
+        print("=" * 60)
+        print("File: " + cache_file)
+        print("So luong frames: " + str(len(full_frames)))
+        file_size = os.path.getsize(cache_file) / 1024
+        print("Kich thuoc file: " + str(round(file_size, 2)) + " KB")
+        duration = len(full_frames) / fps
+        print("Thoi luong tuong duong: " + str(round(duration, 2)) + " giay")
+        print("=" * 60)
         
-        return  # ⚠️ Thoát chương trình, KHÔNG chạy phần nhép môi
-    # ========================================================================
+        return
 
     if not args.audio.endswith(".wav"):
         print("Converting audio to .wav")
-        subprocess.check_call(
-            [
-                "ffmpeg",
-                "-y",
-                "-loglevel",
-                "error",
-                "-i",
-                args.audio,
-                "temp/temp.wav",
-            ]
-        )
+        subprocess.check_call([
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", args.audio, "temp/temp.wav"
+        ])
         args.audio = "temp/temp.wav"
 
     print("analysing audio...")
@@ -722,48 +656,39 @@ def main():
     mel = audio.melspectrogram(wav)
 
     if np.isnan(mel.reshape(-1)).sum() > 0:
-        raise ValueError(
-            "Mel contains nan! Using a TTS voice? Add a small epsilon noise to the wav file and try again"
-        )
+        raise ValueError("Mel contains nan! Using a TTS voice? Add a small epsilon noise to the wav file and try again")
 
     mel_chunks = []
-
     mel_idx_multiplier = 80.0 / fps
     i = 0
-    while 1:
+    while True:
         start_idx = int(i * mel_idx_multiplier)
         if start_idx + mel_step_size > len(mel[0]):
-            mel_chunks.append(mel[:, len(mel[0]) - mel_step_size :])
+            mel_chunks.append(mel[:, len(mel[0]) - mel_step_size:])
             break
         mel_chunks.append(mel[:, start_idx : start_idx + mel_step_size])
         i += 1
 
-    print(f"🎵 Audio tạo ra {len(mel_chunks)} mel chunks")
-    print(f"📹 Video có {len(full_frames)} frames")
+    print("Audio tao ra " + str(len(mel_chunks)) + " mel chunks")
+    print("Video co " + str(len(full_frames)) + " frames")
 
-    # ========================================================================
-    # 🔧 SYNC FIX TRƯỚC KHI VÀO DATAGEN
-    # Nếu audio dài hơn video, cần loop video TRƯỚC
-    # ========================================================================
     if len(mel_chunks) > len(full_frames):
-        print(f"\n🔄 Audio dài hơn video - Đang loop video...")
+        print("Audio dai hon video - Dang loop video...")
         original_len = len(full_frames)
         looped_frames = []
         while len(looped_frames) < len(mel_chunks):
             looped_frames.extend(full_frames)
         full_frames = looped_frames[:len(mel_chunks)]
-        print(f"✅ Đã loop video: {original_len} → {len(full_frames)} frames")
+        print("Da loop video: " + str(original_len) + " -> " + str(len(full_frames)) + " frames")
     else:
-        # Cắt bớt frames nếu video dài hơn audio
         full_frames = full_frames[:len(mel_chunks)]
-        print(f"✅ Đã cắt video về {len(full_frames)} frames (khớp với audio)")
-    # ========================================================================
+        print("Da cat video ve " + str(len(full_frames)) + " frames (khop voi audio)")
 
     if str(args.preview_settings) == "True":
         full_frames = [full_frames[0]]
         mel_chunks = [mel_chunks[0]]
     
-    print(f"\n🎬 {len(full_frames)} frames sẽ được xử lý")
+    print(str(len(full_frames)) + " frames se duoc xu ly")
     
     batch_size = args.wav2lip_batch_size
     if str(args.preview_settings) == "True":
@@ -781,11 +706,9 @@ def main():
     ):
         if i == 0:
             if not args.quality == "Fast":
-                print(
-                    f"mask size: {args.mask_dilation}, feathering: {args.mask_feathering}"
-                )
+                print("mask size: " + str(args.mask_dilation) + ", feathering: " + str(args.mask_feathering))
                 if not args.quality == "Improved":
-                    print("Loading", args.sr_model)
+                    print("Loading " + args.sr_model)
                     run_params = load_sr()
 
             print("Starting...")
@@ -851,25 +774,40 @@ def main():
         print("converting to final video")
 
         if not os.path.exists("temp/result.mp4"):
-            print("❌ ERROR: temp/result.mp4 không tồn tại!")
-            print("Danh sách file trong temp/:")
+            print("ERROR: temp/result.mp4 khong ton tai!")
+            print("Danh sach file trong temp/:")
             try:
                 print(os.listdir("temp/"))
             except Exception as e:
-                print(f"Không thể list thư mục temp/: {e}")
+                print("Khong the list thu muc temp/: " + str(e))
             raise FileNotFoundError("temp/result.mp4 not found")
         
         if not os.path.exists(args.audio):
-            print(f"❌ ERROR: Audio file không tồn tại: {args.audio}")
-            raise FileNotFoundError(f"Audio file not found: {args.audio}")
+            print("ERROR: Audio file khong ton tai: " + args.audio)
+            raise FileNotFoundError("Audio file not found: " + args.audio)
 
-        print(f"✅ temp/result.mp4 exists - Size: {os.path.getsize('temp/result.mp4')} bytes")
-        print(f"✅ Audio file exists: {args.audio} - Size: {os.path.getsize(args.audio)} bytes")
+        print("temp/result.mp4 exists - Size: " + str(os.path.getsize("temp/result.mp4")) + " bytes")
+        print("Audio file exists: " + args.audio + " - Size: " + str(os.path.getsize(args.audio)) + " bytes")
 
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-i", "temp/result.mp4",
-            "-i", args.audio,
-            "-c:v", "libx264",
-            "-preset", 
+        ffmpeg_cmd = "ffmpeg -y -i temp/result.mp4 -i " + args.audio + " -c:v libx264 -preset medium -crf 18 -c:a aac -b:a 192k -shortest " + args.outfile
+        
+        print("FFMPEG CMD: " + ffmpeg_cmd)
+
+        try:
+            subprocess.run(ffmpeg_cmd, shell=True, check=True)
+            print("FFMPEG DONE - Video saved to: " + args.outfile)
+            
+            if os.path.exists(args.outfile):
+                print("Output file size: " + str(os.path.getsize(args.outfile)) + " bytes")
+            else:
+                print("WARNING: Output file was not created!")
+            
+        except subprocess.CalledProcessError as e:
+            print("FFMPEG FAILED!")
+            print("Return code: " + str(e.returncode))
+            raise Exception("FFmpeg failed with code " + str(e.returncode))
+
+
+if __name__ == "__main__":
+    do_load(args.checkpoint_path)
+    main()

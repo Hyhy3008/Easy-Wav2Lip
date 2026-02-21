@@ -268,11 +268,15 @@ parser.add_argument(
     help="Number of frames to create cache for."
 )
 
+# ============================================================================
+# SHARPEN AMOUNT - Dieu khien do gat cua Kernel
+# Gia tri 1.0 = Net vua, 2.0 = Net manh, 3.0 = Cuc gat
+# ============================================================================
 parser.add_argument(
     "--sharpen_amount",
     type=float,
     default=1.5,
-    help="Do sac net (0.0 = khong net, 1.5 = vua, 3.0 = cuc gat)"
+    help="Do sac net (1.0 = nhe, 1.5 = vua, 2.0 = manh, 3.0 = cuc gat)"
 )
 
 parser.add_argument(
@@ -720,7 +724,6 @@ def main():
         print("Sharpen amount: " + str(args.sharpen_amount))
         if args.enable_color_match:
             print("Color matching: ENABLED")
-        print("Optimized resize order: ENABLED (Upscale first, then downscale)")
     
     batch_size = args.wav2lip_batch_size
     if str(args.preview_settings) == "True":
@@ -766,42 +769,35 @@ def main():
                 f = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
                 f = cv2.cvtColor(f, cv2.COLOR_GRAY2BGR)
 
-            # Lay vung mat goc de lam reference
             cf = f[y1:y2, x1:x2].copy()
 
             # ================================================================
-            # PIPELINE SIEU SAC NET - OPTIMIZED RESIZE ORDER
+            # DAY CHUYEN XU LY TOAN PHAN (SEQUENTIAL PIPELINE)
             # ================================================================
             if args.quality == "Enhanced":
-                # BUOC 1: GFPGAN upscale (96x96 -> 512x512)
-                # KHONG resize truoc! De AI lam net tren anh goc
+                # BUOC 1: GFPGAN Upscale tren anh goc 96x96
+                # AI lam net tren anh nho de giu chi tiet tot nhat
                 p = upscale(p.astype(np.uint8), run_params)
                 
-                # BUOC 2: Downscale voi LANCZOS4 (512x512 -> target_size)
-                # Thu nho anh net dep hon phong to anh mo
+                # BUOC 2: Thu nho voi LANCZOS4 (Chong nhoe)
+                # Thu nho anh net luon dep hon phong to anh mo
                 p = cv2.resize(p, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
                 
-                # BUOC 3: Strong Sharpening - Ma tran loc sac net
-                # Kernel nay nhan manh cac canh (edges)
+                # BUOC 3: Kernel Sharpening - Nhan manh rang va moi
+                # Kernel dieu khien boi slider (sharpen_amount)
+                strength = args.sharpen_amount
                 sharpen_kernel = np.array([
-                    [ 0, -1,  0],
-                    [-1,  5, -1],
-                    [ 0, -1,  0]
-                ])
+                    [0, -1, 0],
+                    [-1, strength + 3.5, -1],
+                    [0, -1, 0]
+                ]) / (strength + 0.5)
                 p = cv2.filter2D(p, -1, sharpen_kernel)
                 
                 # BUOC 4: Match Color - Khop mau da
                 if args.enable_color_match:
                     p = match_color(cf, p)
                 
-                # BUOC 5: Unsharp Masking - Sharpen nhe them (neu can)
-                if args.sharpen_amount > 1.0:
-                    p_blurred = cv2.GaussianBlur(p, (0, 0), 2.0)
-                    alpha = args.sharpen_amount
-                    beta = 1.0 - args.sharpen_amount
-                    p = cv2.addWeighted(p, alpha, p_blurred, beta, 0)
-                
-                # BUOC 6: Mask - Blend voi anh goc
+                # BUOC 5: Mask Blending - Dan mat len video
                 if p.shape[:2] != cf.shape[:2]:
                     p = cv2.resize(p, (target_w, target_h))
                 
@@ -827,11 +823,9 @@ def main():
             else:
                 p = cv2.resize(p.astype(np.uint8), (target_w, target_h))
 
-            # Dam bao kich thuoc cuoi cung khop
             if p.shape[0] != target_h or p.shape[1] != target_w:
                 p = cv2.resize(p, (target_w, target_h))
 
-            # Dan vao frame
             f[y1:y2, x1:x2] = p
 
             if not g_colab:

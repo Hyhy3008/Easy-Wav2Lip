@@ -268,6 +268,17 @@ parser.add_argument(
     help="Number of frames to create cache for."
 )
 
+# ============================================================================
+# THAM SO MOI: DO SAC NET (SHARPEN SLIDER)
+# ============================================================================
+parser.add_argument(
+    "--sharpen_amount",
+    type=float,
+    default=1.5,
+    help="Do sac net (0.0 = khong net, 1.5 = vua, 3.0 = cuc gat)"
+)
+# ============================================================================
+
 args = parser.parse_args()
 
 with open(os.path.join("checkpoints", "predictor.pkl"), "rb") as f:
@@ -675,6 +686,10 @@ def main():
     
     print("Processing " + str(len(full_frames)) + " frames...")
     
+    # In thong tin sharpen
+    if args.quality == "Enhanced":
+        print("Sharpen amount: " + str(args.sharpen_amount))
+    
     batch_size = args.wav2lip_batch_size
     if str(args.preview_settings) == "True":
         gen = datagen(full_frames, mel_chunks)
@@ -736,12 +751,20 @@ def main():
                     p, _ = create_mask(p, cf)
 
             # ================================================================
-            # SHARPENING - LAM SAC NET CHI TIET (Unsharp Masking)
-            # Chi mat 0.1ms, khong anh huong toc do
+            # SHARPENING LINH HOAT THEO SLIDER
+            # sharpen_amount = 0.0 -> Khong lam net
+            # sharpen_amount = 1.0 -> Giu nguyen
+            # sharpen_amount = 1.5 -> Net vua (mac dinh)
+            # sharpen_amount = 3.0 -> Cuc gat
             # ================================================================
-            if args.quality == "Enhanced":
+            if args.quality == "Enhanced" and args.sharpen_amount > 1.0:
                 p_blurred = cv2.GaussianBlur(p, (0, 0), 2.0)
-                p = cv2.addWeighted(p, 1.5, p_blurred, -0.5, 0)
+                # Cong thuc: output = alpha * input + beta * blurred
+                # alpha = sharpen_amount
+                # beta = 1 - sharpen_amount (so am de tru di)
+                alpha = args.sharpen_amount
+                beta = 1.0 - args.sharpen_amount
+                p = cv2.addWeighted(p, alpha, p_blurred, beta, 0)
             # ================================================================
 
             if p.shape[0] != target_h or p.shape[1] != target_w:

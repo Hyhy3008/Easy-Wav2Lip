@@ -1,75 +1,84 @@
-print("\rloading torch       ", end="")
+"""
+Wav2LipEngine - Always-On Architecture
+=======================================
+Model được nạp 1 lần duy nhất vào VRAM.
+Gọi process() nhiều lần mà không cần reload.
+"""
+
+# ============================================================================
+# IMPORTS
+# ============================================================================
+print("\rLoading torch       ", end="")
 import torch
 
-print("\rloading numpy       ", end="")
+print("\rLoading numpy       ", end="")
 import numpy as np
 
-print("\rloading argparse    ", end="")
-import argparse
-
-print("\rloading configparser", end="")
-import configparser
-
-print("\rloading math        ", end="")
-import math
-
-print("\rloading os          ", end="")
-import os
-
-print("\rloading subprocess  ", end="")
-import subprocess
-
-print("\rloading pickle      ", end="")
-import pickle
-
-print("\rloading cv2         ", end="")
+print("\rLoading cv2         ", end="")
 import cv2
 
-print("\rloading audio       ", end="")
-import audio
+print("\rLoading os          ", end="")
+import os
 
-print("\rloading RetinaFace ", end="")
-from batch_face import RetinaFace
+print("\rLoading subprocess  ", end="")
+import subprocess
 
-print("\rloading re          ", end="")
-import re
+print("\rLoading pickle      ", end="")
+import pickle
 
-print("\rloading partial     ", end="")
-from functools import partial
+print("\rLoading math        ", end="")
+import math
 
-print("\rloading tqdm        ", end="")
+print("\rLoading tqdm        ", end="")
 from tqdm import tqdm
 
-print("\rloading warnings    ", end="")
+print("\rLoading audio       ", end="")
+import audio
+
+print("\rLoading RetinaFace  ", end="")
+from batch_face import RetinaFace
+
+print("\rLoading warnings    ", end="")
 import warnings
-
-print("\rloading sys         ", end="")
-import sys
-
-print("\rloading gc          ", end="")
-import gc
-
 warnings.filterwarnings(
     "ignore", category=UserWarning, module="torchvision.transforms.functional_tensor"
 )
 
-print("\rloading GFPGAN      ", end="")
+print("\rLoading GFPGAN      ", end="")
 from gfpgan import GFPGANer
 
-print("\rloading load_model  ", end="")
-from easy_functions import load_model, g_colab
+print("\rLoading load_model  ", end="")
+from easy_functions import load_model
 
-print("\rimports loaded!     ")
+print("\rImports loaded!     ")
+
+# ============================================================================
+# LOAD PREDICTORS (Dlib) - Chỉ load 1 lần khi import module
+# ============================================================================
+print("Loading face predictors...")
+with open(os.path.join("checkpoints", "predictor.pkl"), "rb") as f:
+    predictor = pickle.load(f)
+
+with open(os.path.join("checkpoints", "mouth_detector.pkl"), "rb") as f:
+    mouth_detector = pickle.load(f)
+
+print("Predictors loaded!")
+
+# ============================================================================
+# CONSTANTS
+# ============================================================================
+MEL_STEP_SIZE = 16
+IMG_SIZE = 96
 
 
 # ============================================================================
-# GLOBAL HELPER FUNCTIONS (Dùng chung cho cả Class và CLI)
+# HELPER FUNCTIONS (Giữ nguyên các hàm đã tối ưu)
 # ============================================================================
 
 def match_color(target, source):
     """
-    Ep mau anh source theo mau anh target.
-    Dung khong gian mau Lab de giu do tu nhien.
+    Ép màu ảnh source theo màu ảnh target.
+    Dùng không gian màu Lab để giữ độ tự nhiên.
     """
     if target.shape != source.shape:
         source = cv2.resize(source, (target.shape[1], target.shape[0]))
@@ -94,8 +103,95 @@ def match_color(target, source):
     return result
 
 
-def get_smoothened_boxes(boxes, T):
-    """Lam muot toa do face detection"""
+def create_mask(img, original_img, mask_dilation=150, mask_feathering=151, cached_mask=None):
+    """
+    Tạo mask vùng miệng bằng Numpy (No-PIL).
+    Trả về (blended_image, mask) để có thể cache mask.
+    """
+    if cached_mask is not None:
+        mask_to_use = cv2.resize(cached_mask, (img.shape[1], img.shape[0]))
+    else:
+        faces = mouth_detector(img)
+        if len(faces) == 0:
+            return img, None
+        
+        face = faces[0]
+        shape = predictor(img, face)
+        
+        mouth_points = np.array([[shape.part(i).x, shape.part(i).y] for i in range(48, 68)])
+        x, y, w, h = cv2.boundingRect(mouth_points)
+        
+        mask = np.zeros(img.shape[:2], dtype=np.uint8)
+        cv2.fillConvexPoly(mask, mouth_points, 255)
+        
+        kernel_size = int(max(w, h) * mask_dilation / 100)
+        if kernel_size < 1:
+            kernel_size = 1
+        kernel = np.ones((kernel_size, kernel_size), np.uint8)
+        dilated_mask = cv2.dilate(mask, kernel)
+        
+        if mask_feathering > 0:
+            blur = int(max(w, h) * mask_feathering / 100)
+            if blur % 2 == 0:
+                blur += 1
+            if blur < 1:
+                blur = 1
+            mask_to_use = cv2.GaussianBlur(dilated_mask, (blur, blur), 0)
+        else:
+            mask_to_use = dilated_mask
+    
+    # Blend using Numpy (No-PIL)
+    mask_3ch = cv2.cvtColor(mask_to_use, cv2.COLOR_GRAY2BGR).astype(np.float32) / 255.0
+    out = (img.astype(np.float32) * mask_3ch + original_img.astype(np.float32) * (1 - mask_3ch))
+    out = np.clip(out, 0, 255).astype(np.uint8)
+    
+    return out, mask_to_use
+
+
+def create_tracked_mask(img, original_img, mask_dilation=150, mask_feathering=151, last_mask=None):
+    """
+    Tạo mask với tracking miệng theo từng frame.
+    """
+    faces = mouth_detector(img)
+    
+    if len(faces) == 0:
+        if last_mask is not None:
+            mask_to_use = cv2.resize(last_mask, (img.shape[1], img.shape[0]))
+        else:
+            return img, None
+    else:
+        face = faces[0]
+        shape = predictor(img, face)
+        
+        mouth_points = np.array([[shape.part(i).x, shape.part(i).y] for i in range(48, 68)])
+        x, y, w, h = cv2.boundingRect(mouth_points)
+        
+        kernel_size = int(max(w, h) * mask_dilation / 100)
+        if kernel_size < 1:
+            kernel_size = 1
+        kernel = np.ones((kernel_size, kernel_size), np.uint8)
+        
+        mask = np.zeros(img.shape[:2], dtype=np.uint8)
+        cv2.fillConvexPoly(mask, mouth_points, 255)
+        dilated_mask = cv2.dilate(mask, kernel)
+        
+        blur = int(max(w, h) * mask_feathering / 100)
+        if blur % 2 == 0:
+            blur += 1
+        if blur < 1:
+            blur = 1
+        
+        mask_to_use = cv2.GaussianBlur(dilated_mask, (blur, blur), 0)
+    
+    mask_3ch = cv2.cvtColor(mask_to_use, cv2.COLOR_GRAY2BGR).astype(np.float32) / 255.0
+    out = (img.astype(np.float32) * mask_3ch + original_img.astype(np.float32) * (1 - mask_3ch))
+    out = np.clip(out, 0, 255).astype(np.uint8)
+    
+    return out, mask_to_use
+
+
+def get_smoothened_boxes(boxes, T=5):
+    """Làm mượt bounding boxes."""
     smoothed = []
     for i in range(len(boxes)):
         start = max(0, i - T // 2)
@@ -106,286 +202,142 @@ def get_smoothened_boxes(boxes, T):
     return np.array(smoothed)
 
 
-def load_sr_model():
-    """Load GFPGAN super resolution model"""
-    sr_device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print("Loading GFPGAN on device: " + sr_device)
-    run_params = GFPGANer(
-        model_path="checkpoints/GFPGANv1.4.pth",
-        upscale=1,
-        arch="clean",
-        channel_multiplier=2,
-        bg_upsampler=None,
-        device=torch.device(sr_device)
-    )
-    return run_params
-
-
-def upscale_with_gfpgan(image, gfpgan_model):
-    """Upscale image using GFPGAN"""
-    try:
-        _, restored_faces, _ = gfpgan_model.enhance(
-            image,
-            has_aligned=True,
-            only_center_face=False,
-            paste_back=False
-        )
-        return restored_faces[0]
-    except Exception as e:
-        print("Error in upscale: " + str(e))
-        return image
-
-
 # ============================================================================
-# CLASS WAV2LIP ENGINE (CORE - ALWAYS-ON ARCHITECTURE)
+# WAV2LIP ENGINE CLASS
 # ============================================================================
 
 class Wav2LipEngine:
     """
-    Wav2Lip Engine - Load models 1 lan, xu ly nhieu lan
-    
-    Usage:
-        engine = Wav2LipEngine(gpu_id=0, checkpoint_path="...")
-        output = engine.process(video_path, audio_path, output_path, settings)
+    Always-On Wav2Lip Engine.
+    Load models 1 lần, gọi process() nhiều lần.
     """
     
-    def __init__(self, gpu_id, checkpoint_path, load_sr=True):
+    def __init__(self, gpu_id=0, checkpoint_path="checkpoints/wav2lip.pth", load_sr_model=True):
         """
-        Khoi tao engine - Load models vao VRAM 1 lan duy nhat
+        Khởi tạo Engine và nạp models vào VRAM.
         
         Args:
-            gpu_id: ID cua GPU (0 hoac 1)
-            checkpoint_path: Duong dan den checkpoint Wav2Lip
-            load_sr: Co load GFPGAN khong
+            gpu_id: ID của GPU (0, 1, 2...)
+            checkpoint_path: Đường dẫn tới model Wav2Lip
+            load_sr_model: Có nạp GFPGAN không
         """
-        print(f"\n{'='*60}")
-        print(f"INITIALIZING WAV2LIP ENGINE ON GPU {gpu_id}")
-        print(f"{'='*60}")
-        
-        # Device setup
-        self.gpu_id = gpu_id
+        # Xác định device
         if torch.cuda.is_available():
             self.device = f'cuda:{gpu_id}'
-            torch.cuda.set_device(gpu_id)
+            self.gpu_id = gpu_id
         elif torch.backends.mps.is_available():
             self.device = 'mps'
+            self.gpu_id = -1
         else:
             self.device = 'cpu'
+            self.gpu_id = -1
+            print("⚠️ Warning: No GPU detected! Inference will be VERY SLOW!")
         
-        print(f"Device: {self.device}")
+        print(f"🔌 Initializing Wav2LipEngine on {self.device}...")
         
         # Load Wav2Lip model
-        print("Loading Wav2Lip model...")
+        print(f"   Loading Wav2Lip model...")
         self.model = load_model(checkpoint_path)
         self.model = self.model.to(self.device)
         self.model.eval()
-        print("  - Wav2Lip loaded!")
+        print(f"   ✅ Wav2Lip model loaded!")
         
-        # Load GFPGAN (optional)
-        self.sr_model = None
-        if load_sr:
-            print("Loading GFPGAN...")
-            self.sr_model = load_sr_model()
-            print("  - GFPGAN loaded!")
-        
-        # Load Face Detector
-        print("Loading Face Detector...")
+        # Load Face Detector (RetinaFace)
+        print(f"   Loading RetinaFace detector...")
         self.detector = RetinaFace(
-            gpu_id=gpu_id if torch.cuda.is_available() else -1,
+            gpu_id=self.gpu_id,
             model_path="checkpoints/mobilenet.pth",
             network="mobilenet"
         )
-        self.detector_model = self.detector.model
-        print("  - Face Detector loaded!")
+        print(f"   ✅ RetinaFace loaded!")
         
-        # Load Dlib predictor (for masking)
-        print("Loading Dlib Predictor...")
-        with open(os.path.join("checkpoints", "predictor.pkl"), "rb") as f:
-            self.predictor = pickle.load(f)
-        with open(os.path.join("checkpoints", "mouth_detector.pkl"), "rb") as f:
-            self.mouth_detector = pickle.load(f)
-        print("  - Dlib loaded!")
+        # Load Super Resolution model (GFPGAN)
+        self.sr_model = None
+        if load_sr_model:
+            print(f"   Loading GFPGAN model...")
+            self.sr_model = self._load_sr()
+            print(f"   ✅ GFPGAN loaded!")
         
-        # State variables for masking
-        self.last_mask = None
-        self.kernel = None
-        
-        print(f"{'='*60}")
-        print(f"ENGINE READY ON {self.device}")
-        print(f"{'='*60}\n")
+        print(f"✅ Wav2LipEngine Ready on {self.device}!")
     
+    def _load_sr(self):
+        """Load GFPGAN model."""
+        sr_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        return GFPGANer(
+            model_path="checkpoints/GFPGANv1.4.pth",
+            upscale=1,
+            arch="clean",
+            channel_multiplier=2,
+            bg_upsampler=None,
+            device=torch.device(sr_device)
+        )
     
-    def process(self, video_path, audio_path, output_path, settings):
+    def _upscale(self, image):
+        """Upscale image using GFPGAN."""
+        if self.sr_model is None:
+            return image
+        try:
+            _, restored_faces, _ = self.sr_model.enhance(
+                image,
+                has_aligned=True,
+                only_center_face=False,
+                paste_back=False
+            )
+            return restored_faces[0]
+        except Exception as e:
+            print(f"⚠️ Upscale error: {e}")
+            return image
+    
+    def _face_rect_generator(self, images, batch_size=16):
+        """Generator để detect faces theo batch."""
+        num_batches = math.ceil(len(images) / batch_size)
+        prev_ret = None
+        
+        for i in range(num_batches):
+            batch = images[i * batch_size : (i + 1) * batch_size]
+            all_faces = self.detector(batch)
+            
+            for faces in all_faces:
+                if faces:
+                    box, landmarks, score = faces[0]
+                    prev_ret = tuple(map(int, box))
+                yield prev_ret
+    
+    def _face_detect(self, images, cache_file=None, pads=(0, 10, 0, 0), 
+                     batch_size=16, smooth=True):
         """
-        Xu ly video - Ham chinh goi di goi lai nhieu lan
+        Detect faces và cache kết quả.
         
         Args:
-            video_path: Duong dan video input
-            audio_path: Duong dan audio input
-            output_path: Duong dan video output
-            settings: Dictionary chua cac tham so
-                - quality: "Fast", "Improved", "Enhanced"
-                - sharpen_amount: 1.0 - 3.0
-                - enable_color_match: True/False
-                - cache_file: "cache.pkl"
-                - fps, batch_size, pads, mask_dilation, etc.
+            images: List các frame
+            cache_file: Đường dẫn file cache (.pkl)
+            pads: Padding (top, bottom, left, right)
+            batch_size: Batch size cho face detection
+            smooth: Có làm mượt bounding boxes không
         
         Returns:
-            output_path: Duong dan video da xu ly
+            List of [face_crop, (y1, y2, x1, x2)]
         """
-        try:
-            # Reset state
-            self.last_mask = None
-            
-            # 1. Load video
-            print("\n1. Loading video...")
-            full_frames, fps = self._load_video(video_path, settings)
-            print(f"   Loaded {len(full_frames)} frames at {fps} FPS")
-            
-            # 2. Load audio
-            print("\n2. Loading audio...")
-            mel_chunks = self._load_audio(audio_path, fps, settings)
-            print(f"   Generated {len(mel_chunks)} mel chunks")
-            
-            # 3. Face detection
-            print("\n3. Face detection...")
-            face_det_results = self._face_detect(full_frames, settings)
-            print(f"   Detected {len(face_det_results)} face entries")
-            
-            # 4. Sync frames and cache
-            print("\n4. Syncing frames and cache...")
-            full_frames, face_det_results = self._sync_frames_cache(
-                full_frames, face_det_results, mel_chunks
-            )
-            print(f"   Synced: {len(full_frames)} frames")
-            
-            # 5. Inference
-            print("\n5. Running Wav2Lip inference...")
-            output_frames = self._inference_loop(
-                full_frames, face_det_results, mel_chunks, settings
-            )
-            
-            # 6. Save video
-            print("\n6. Saving video...")
-            final_output = self._save_video(
-                output_frames, audio_path, output_path, fps, settings
-            )
-            
-            print(f"\n{'='*60}")
-            print(f"DONE! Saved to: {final_output}")
-            print(f"{'='*60}\n")
-            
-            return final_output
-            
-        finally:
-            # Cleanup
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            gc.collect()
-    
-    
-    def _load_video(self, video_path, settings):
-        """Load video frames"""
-        # Check if image
-        if os.path.isfile(video_path) and video_path.split(".")[-1] in ["jpg", "png", "jpeg"]:
-            full_frames = [cv2.imread(video_path)]
-            fps = settings.get('fps', 25.0)
-            return full_frames, fps
-        
-        # Load video
-        video_stream = cv2.VideoCapture(video_path)
-        fps = video_stream.get(cv2.CAP_PROP_FPS)
-        
-        full_frames = []
-        while True:
-            still_reading, frame = video_stream.read()
-            if not still_reading:
-                video_stream.release()
-                break
-            
-            # Resize if needed
-            if settings.get('fullres', 3) != 1:
-                out_height = settings.get('out_height', 480)
-                aspect_ratio = frame.shape[1] / frame.shape[0]
-                frame = cv2.resize(frame, (int(out_height * aspect_ratio), out_height))
-            
-            # Rotate if needed
-            if settings.get('rotate', False):
-                frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-            
-            # Crop if needed
-            crop = settings.get('crop', [0, -1, 0, -1])
-            y1, y2, x1, x2 = crop
-            if x2 == -1:
-                x2 = frame.shape[1]
-            if y2 == -1:
-                y2 = frame.shape[0]
-            frame = frame[y1:y2, x1:x2]
-            
-            full_frames.append(frame)
-        
-        return full_frames, fps
-    
-    
-    def _load_audio(self, audio_path, fps, settings):
-        """Load and process audio to mel spectrogram"""
-        # Convert to wav if needed
-        if not audio_path.endswith(".wav"):
-            print("   Converting audio to .wav...")
-            subprocess.check_call([
-                "ffmpeg", "-y", "-loglevel", "error",
-                "-i", audio_path, "temp/temp.wav"
-            ])
-            audio_path = "temp/temp.wav"
-        
-        # Load wav
-        wav = audio.load_wav(audio_path, 16000)
-        mel = audio.melspectrogram(wav)
-        
-        if np.isnan(mel.reshape(-1)).sum() > 0:
-            raise ValueError("Mel contains nan!")
-        
-        # Split into chunks
-        mel_chunks = []
-        mel_step_size = 16
-        mel_idx_multiplier = 80.0 / fps
-        i = 0
-        while True:
-            start_idx = int(i * mel_idx_multiplier)
-            if start_idx + mel_step_size > len(mel[0]):
-                mel_chunks.append(mel[:, len(mel[0]) - mel_step_size:])
-                break
-            mel_chunks.append(mel[:, start_idx : start_idx + mel_step_size])
-            i += 1
-        
-        return mel_chunks
-    
-    
-    def _face_detect(self, images, settings):
-        """Detect faces in all frames"""
-        cache_file = settings.get('cache_file', 'last_detected_face.pkl')
-        
         # Check cache
-        if os.path.exists(cache_file):
-            print(f"   Loading from cache: {cache_file}")
+        if cache_file and os.path.exists(cache_file):
+            print(f"📦 Loading face cache: {cache_file}")
             with open(cache_file, "rb") as f:
-                return pickle.load(f)
+                cached = pickle.load(f)
+            print(f"   ✅ Loaded {len(cached)} cached entries")
+            return cached
         
-        # Run detection
-        print("   No cache found. Running face detection...")
+        print(f"🔍 Detecting faces for {len(images)} frames...")
         results = []
-        pads = settings.get('pads', [0, 10, 0, 0])
         pady1, pady2, padx1, padx2 = pads
         
-        # Face detection
         for image, rect in tqdm(
-            zip(images, self._face_rect(images, settings)),
+            zip(images, self._face_rect_generator(images, batch_size)),
             total=len(images),
-            desc="   Detecting faces",
+            desc="Detecting faces",
             ncols=100
         ):
             if rect is None:
-                raise ValueError("Face not detected!")
+                raise ValueError("Face not detected! Ensure video contains a face.")
             
             y1 = int(max(0, rect[1] - pady1))
             y2 = int(min(image.shape[0], rect[3] + pady2))
@@ -393,12 +345,13 @@ class Wav2LipEngine:
             x2 = int(min(image.shape[1], rect[2] + padx2))
             results.append([x1, y1, x2, y2])
         
-        # Smoothing
         boxes = np.array(results, dtype=np.int32)
-        if str(settings.get('nosmooth', False)) == "False":
+        
+        # Smooth boxes
+        if smooth:
             boxes = get_smoothened_boxes(boxes, T=5)
         
-        # Create final results
+        # Create final results with face crops
         final_results = []
         for i, (x1, y1, x2, y2) in enumerate(boxes):
             x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
@@ -406,205 +359,411 @@ class Wav2LipEngine:
             final_results.append([face_crop, (y1, y2, x1, x2)])
         
         # Save cache
-        with open(cache_file, "wb") as f:
-            pickle.dump(final_results, f)
+        if cache_file:
+            with open(cache_file, "wb") as f:
+                pickle.dump(final_results, f)
+            print(f"   💾 Saved cache: {len(final_results)} entries -> {cache_file}")
         
         return final_results
     
-    
-    def _face_rect(self, images, settings):
-        """Generator for face rectangles"""
-        batch_size = settings.get('face_det_batch_size', 16)
-        num_batches = math.ceil(len(images) / batch_size)
-        prev_ret = None
+    def _load_video(self, video_path, resize_height=None, crop=None):
+        """
+        Load video frames.
         
-        for i in range(num_batches):
-            batch = images[i * batch_size : (i + 1) * batch_size]
-            all_faces = self.detector(batch)
-            for faces in all_faces:
-                if faces:
-                    box, landmarks, score = faces[0]
-                    prev_ret = tuple(map(int, box))
-                yield prev_ret
+        Args:
+            video_path: Đường dẫn video hoặc ảnh
+            resize_height: Chiều cao resize (None = giữ nguyên)
+            crop: Tuple (y1, y2, x1, x2) để crop
+        
+        Returns:
+            (frames, fps)
+        """
+        # Check if image
+        if video_path.lower().endswith(('.jpg', '.png', '.jpeg')):
+            frame = cv2.imread(video_path)
+            if frame is None:
+                raise ValueError(f"Cannot read image: {video_path}")
+            return [frame], 25.0
+        
+        # Load video
+        video = cv2.VideoCapture(video_path)
+        fps = video.get(cv2.CAP_PROP_FPS)
+        
+        frames = []
+        while True:
+            ret, frame = video.read()
+            if not ret:
+                break
+            
+            # Resize
+            if resize_height and resize_height > 0:
+                aspect = frame.shape[1] / frame.shape[0]
+                frame = cv2.resize(frame, (int(resize_height * aspect), resize_height))
+            
+            # Crop
+            if crop:
+                y1, y2, x1, x2 = crop
+                if x2 == -1:
+                    x2 = frame.shape[1]
+                if y2 == -1:
+                    y2 = frame.shape[0]
+                frame = frame[y1:y2, x1:x2]
+            
+            frames.append(frame)
+        
+        video.release()
+        print(f"📹 Loaded {len(frames)} frames at {fps:.2f} FPS")
+        return frames, fps
     
+    def _load_audio(self, audio_path, fps):
+        """
+        Load audio và tạo mel spectrogram chunks.
+        
+        Returns:
+            List of mel chunks
+        """
+        # Convert to wav if needed
+        if not audio_path.endswith('.wav'):
+            print("🔊 Converting audio to WAV...")
+            wav_path = "temp/temp_audio.wav"
+            subprocess.check_call([
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-i", audio_path, wav_path
+            ])
+            audio_path = wav_path
+        
+        print("🔊 Analyzing audio...")
+        wav = audio.load_wav(audio_path, 16000)
+        mel = audio.melspectrogram(wav)
+        
+        if np.isnan(mel.reshape(-1)).sum() > 0:
+            raise ValueError("Mel spectrogram contains NaN!")
+        
+        mel_chunks = []
+        mel_idx_multiplier = 80.0 / fps
+        i = 0
+        
+        while True:
+            start_idx = int(i * mel_idx_multiplier)
+            if start_idx + MEL_STEP_SIZE > len(mel[0]):
+                mel_chunks.append(mel[:, len(mel[0]) - MEL_STEP_SIZE:])
+                break
+            mel_chunks.append(mel[:, start_idx : start_idx + MEL_STEP_SIZE])
+            i += 1
+        
+        print(f"   ✅ Created {len(mel_chunks)} mel chunks")
+        return mel_chunks
     
-    def _sync_frames_cache(self, frames, cache, mel_chunks):
-        """Sync frames and cache, loop if needed"""
-        # If audio longer than video, loop video
-        if len(mel_chunks) > len(frames):
-            print(f"   Audio longer - looping video: {len(frames)} -> {len(mel_chunks)} frames")
-            original_frames = frames.copy()
+    def _prepare_batch(self, faces, mels):
+        """
+        Chuẩn bị batch cho inference.
+        
+        Returns:
+            (img_batch, mel_batch) as torch tensors on device
+        """
+        img_batch = np.asarray(faces)
+        mel_batch = np.asarray(mels)
+        
+        # Mask bottom half of faces
+        img_masked = img_batch.copy()
+        img_masked[:, IMG_SIZE // 2:] = 0
+        
+        # Concatenate masked and original
+        img_batch = np.concatenate((img_masked, img_batch), axis=3) / 255.0
+        
+        # Reshape mel
+        mel_batch = np.reshape(mel_batch, [len(mel_batch), mel_batch.shape[1], mel_batch.shape[2], 1])
+        
+        # Convert to torch tensors
+        img_tensor = torch.FloatTensor(np.transpose(img_batch, (0, 3, 1, 2))).to(self.device)
+        mel_tensor = torch.FloatTensor(np.transpose(mel_batch, (0, 3, 1, 2))).to(self.device)
+        
+        return img_tensor, mel_tensor
+    
+    def process(self, video_path, audio_path, output_path, settings=None):
+        """
+        Xử lý lip-sync cho video.
+        
+        Args:
+            video_path: Đường dẫn video input
+            audio_path: Đường dẫn audio input
+            output_path: Đường dẫn video output
+            settings: Dictionary chứa các tham số:
+                - quality: "Fast" | "Improved" | "Enhanced"
+                - sharpen_amount: float (1.0 - 3.0)
+                - enable_color_match: bool
+                - mask_dilation: int (50 - 200)
+                - mask_feathering: int (50 - 200)
+                - mouth_tracking: bool
+                - batch_size: int
+                - resize_height: int (0 = no resize)
+                - crop: tuple (y1, y2, x1, x2)
+                - pads: tuple (top, bottom, left, right)
+                - cache_file: str (path to cache .pkl)
+                - smooth_boxes: bool
+                - debug_mask: bool
+                - preview_only: bool (chỉ xử lý 1 frame)
+        
+        Returns:
+            output_path nếu thành công
+        """
+        # Default settings
+        s = {
+            'quality': 'Enhanced',
+            'sharpen_amount': 1.5,
+            'enable_color_match': True,
+            'mask_dilation': 150,
+            'mask_feathering': 151,
+            'mouth_tracking': False,
+            'batch_size': 1,
+            'resize_height': 0,
+            'crop': (0, -1, 0, -1),
+            'pads': (0, 10, 0, 0),
+            'cache_file': None,
+            'smooth_boxes': True,
+            'debug_mask': False,
+            'preview_only': False,
+        }
+        
+        # Update with user settings
+        if settings:
+            s.update(settings)
+        
+        print("=" * 60)
+        print("🎬 WAV2LIP PROCESSING")
+        print("=" * 60)
+        print(f"   Quality: {s['quality']}")
+        print(f"   Sharpen: {s['sharpen_amount']}")
+        print(f"   Color Match: {s['enable_color_match']}")
+        print(f"   Mask Dilation: {s['mask_dilation']}")
+        print(f"   Mask Feathering: {s['mask_feathering']}")
+        print("=" * 60)
+        
+        # ================================================================
+        # STEP 1: LOAD VIDEO
+        # ================================================================
+        resize_h = s['resize_height'] if s['resize_height'] > 0 else None
+        full_frames, fps = self._load_video(video_path, resize_h, s['crop'])
+        
+        if s['preview_only']:
+            full_frames = [full_frames[0]]
+        
+        # ================================================================
+        # STEP 2: LOAD AUDIO
+        # ================================================================
+        mel_chunks = self._load_audio(audio_path, fps)
+        
+        if s['preview_only']:
+            mel_chunks = [mel_chunks[0]]
+        
+        # ================================================================
+        # STEP 3: SYNC VIDEO & AUDIO LENGTH
+        # ================================================================
+        print(f"📊 Sync Info:")
+        print(f"   Video: {len(full_frames)} frames")
+        print(f"   Audio: {len(mel_chunks)} mel chunks")
+        
+        if len(mel_chunks) > len(full_frames):
+            print("   ⚠️ Audio longer than video - Looping video...")
+            original_len = len(full_frames)
             looped_frames = []
             while len(looped_frames) < len(mel_chunks):
-                looped_frames.extend(original_frames)
-            frames = looped_frames[:len(mel_chunks)]
-            
-            # Loop cache accordingly
-            looped_cache = []
-            while len(looped_cache) < len(mel_chunks):
-                looped_cache.extend(cache)
-            cache = looped_cache[:len(mel_chunks)]
+                looped_frames.extend(full_frames)
+            full_frames = looped_frames[:len(mel_chunks)]
+            print(f"   ✅ Looped: {original_len} -> {len(full_frames)} frames")
         else:
-            # Trim to mel_chunks length
-            frames = frames[:len(mel_chunks)]
-            cache = cache[:len(mel_chunks)]
+            full_frames = full_frames[:len(mel_chunks)]
+            print(f"   ✅ Trimmed to: {len(full_frames)} frames")
         
-        # Final sync check
-        min_len = min(len(frames), len(cache))
-        frames = frames[:min_len]
-        cache = cache[:min_len]
+        # ================================================================
+        # STEP 4: FACE DETECTION (với Cache)
+        # ================================================================
+        face_det_results = self._face_detect(
+            full_frames,
+            cache_file=s['cache_file'],
+            pads=s['pads'],
+            batch_size=s['batch_size'],
+            smooth=s['smooth_boxes']
+        )
         
-        return frames, cache
-    
-    
-    def _inference_loop(self, frames, face_det_results, mel_chunks, settings):
-        """Main inference loop"""
-        output_frames = []
-        img_size = 96
-        batch_size = settings.get('batch_size', 1)
-        quality = settings.get('quality', 'Fast')
+        # ================================================================
+        # SYNC FIX: Đảm bảo frames và cache khớp nhau
+        # ================================================================
+        num_synced = min(len(full_frames), len(face_det_results), len(mel_chunks))
+        full_frames = full_frames[:num_synced]
+        face_det_results = face_det_results[:num_synced]
+        mel_chunks = mel_chunks[:num_synced]
         
-        num_synced = len(frames)
+        print(f"   🔄 Synced to: {num_synced} frames")
         
-        for i in tqdm(range(len(mel_chunks)), desc="   Processing", ncols=100):
-            idx = i % num_synced
-            
-            frame = frames[idx].copy()
-            face, coords = face_det_results[idx]
-            mel = mel_chunks[i]
-            
-            y1, y2, x1, x2 = coords
-            target_h = y2 - y1
-            target_w = x2 - x1
-            
-            # Prepare input
-            face_resized = cv2.resize(face.copy(), (img_size, img_size))
-            
-            # To tensor
-            img_masked = face_resized.copy()
-            img_masked[:, img_size // 2:] = 0
-            img_input = np.concatenate((img_masked, face_resized), axis=2)
-            img_input = img_input.astype(np.float32) / 255.0
-            img_input = np.transpose(img_input, (2, 0, 1))
-            
-            mel_input = mel.reshape(mel.shape[0], mel.shape[1], 1)
-            mel_input = np.transpose(mel_input, (2, 0, 1))
-            
-            # To torch
-            img_t = torch.FloatTensor(img_input).unsqueeze(0).to(self.device)
-            mel_t = torch.FloatTensor(mel_input).unsqueeze(0).to(self.device)
-            
-            # Inference
-            with torch.no_grad():
-                pred = self.model(mel_t, img_t)
-            
-            # To numpy
-            pred = pred.cpu().numpy()[0].transpose(1, 2, 0) * 255.0
-            pred = pred.astype(np.uint8)
-            
-            # Get original face region
-            cf = frame[y1:y2, x1:x2].copy()
-            
-            # Enhancement pipeline
-            if quality == "Enhanced":
-                # Step 1: GFPGAN upscale (96x96 -> 512x512)
-                if self.sr_model is not None:
-                    pred = upscale_with_gfpgan(pred, self.sr_model)
-                
-                # Step 2: Downscale with LANCZOS4
-                pred = cv2.resize(pred, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
-                
-                # Step 3: Kernel sharpening
-                strength = settings.get('sharpen_amount', 1.5)
-                sharpen_kernel = np.array([
-                    [0, -1, 0],
-                    [-1, strength + 3.5, -1],
-                    [0, -1, 0]
-                ]) / (strength + 0.5)
-                pred = cv2.filter2D(pred, -1, sharpen_kernel)
-                
-                # Step 4: Match color
-                if settings.get('enable_color_match', False):
-                    pred = match_color(cf, pred)
-                
-                # Step 5: Masking
-                pred = self._create_mask(pred, cf, settings)
-            
-            elif quality == "Improved":
-                pred = cv2.resize(pred, (target_w, target_h))
-                pred = self._create_mask(pred, cf, settings)
-            
-            else:  # Fast
-                pred = cv2.resize(pred, (target_w, target_h))
-            
-            # Paste back
-            frame[y1:y2, x1:x2] = pred
-            output_frames.append(frame)
-        
-        return output_frames
-    
-    
-    def _create_mask(self, img, original_img, settings):
-        """Create and apply mouth mask"""
-        if self.last_mask is None:
-            faces = self.mouth_detector(img)
-            if len(faces) == 0:
-                return img
-            
-            face = faces[0]
-            shape = self.predictor(img, face)
-            
-            mouth_points = np.array([[shape.part(i).x, shape.part(i).y] for i in range(48, 68)])
-            x, y, w, h = cv2.boundingRect(mouth_points)
-            
-            mask = np.zeros(img.shape[:2], dtype=np.uint8)
-            cv2.fillConvexPoly(mask, mouth_points, 255)
-            
-            mask_dilation = settings.get('mask_dilation', 150)
-            kernel_size = int(max(w, h) * mask_dilation)
-            if kernel_size < 1:
-                kernel_size = 1
-            kernel = np.ones((kernel_size, kernel_size), np.uint8)
-            dilated_mask = cv2.dilate(mask, kernel)
-            
-            mask_feathering = settings.get('mask_feathering', 151)
-            if mask_feathering != 0:
-                blur = int(max(w, h) * mask_feathering)
-                if blur % 2 == 0:
-                    blur += 1
-                if blur < 1:
-                    blur = 1
-                self.last_mask = cv2.GaussianBlur(dilated_mask, (blur, blur), 0)
-            else:
-                self.last_mask = dilated_mask
-        
-        mask_to_use = cv2.resize(self.last_mask, (img.shape[1], img.shape[0]))
-        mask_3ch = cv2.cvtColor(mask_to_use, cv2.COLOR_GRAY2BGR).astype(float) / 255.0
-        out = (img.astype(float) * mask_3ch + original_img.astype(float) * (1 - mask_3ch)).astype(np.uint8)
-        
-        return out
-    
-    
-    def _save_video(self, frames, audio_path, output_path, fps, settings):
-        """Save video with audio"""
-        # Write video
-        frame_h, frame_w = frames[0].shape[:-1]
+        # ================================================================
+        # STEP 5: SETUP OUTPUT VIDEO
+        # ================================================================
+        frame_h, frame_w = full_frames[0].shape[:2]
+        temp_video = "temp/result_temp.mp4"
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        out = cv2.VideoWriter("temp/result.mp4", fourcc, fps, (frame_w, frame_h))
+        out = cv2.VideoWriter(temp_video, fourcc, fps, (frame_w, frame_h))
         
-        for frame in frames:
-            out.write(frame)
+        # ================================================================
+        # STEP 6: INFERENCE LOOP
+        # ================================================================
+        print(f"🚀 Processing {num_synced} frames...")
         
+        # Cache cho mask (nếu không tracking)
+        cached_mask = None
+        last_tracked_mask = None
+        
+        # Process theo batch
+        batch_size = s['batch_size']
+        
+        img_batch, mel_batch, frame_batch, coords_batch = [], [], [], []
+        
+        for idx, mel in enumerate(tqdm(mel_chunks, desc="Processing", ncols=100)):
+            frame = full_frames[idx].copy()
+            face, coords = face_det_results[idx]
+            
+            # Resize face to model input size
+            face_resized = cv2.resize(face.copy(), (IMG_SIZE, IMG_SIZE))
+            
+            img_batch.append(face_resized)
+            mel_batch.append(mel)
+            frame_batch.append(frame)
+            coords_batch.append(coords)
+            
+            # Process khi đủ batch
+            if len(img_batch) >= batch_size or idx == len(mel_chunks) - 1:
+                # Prepare batch
+                img_tensor, mel_tensor = self._prepare_batch(img_batch, mel_batch)
+                
+                # Inference
+                with torch.no_grad():
+                    pred = self.model(mel_tensor, img_tensor)
+                
+                pred = pred.cpu().numpy().transpose(0, 2, 3, 1) * 255.0
+                
+                # Process each prediction
+                for p, f, c in zip(pred, frame_batch, coords_batch):
+                    y1, y2, x1, x2 = c
+                    target_h = y2 - y1
+                    target_w = x2 - x1
+                    
+                    # Debug mask mode
+                    if s['debug_mask']:
+                        f = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+                        f = cv2.cvtColor(f, cv2.COLOR_GRAY2BGR)
+                    
+                    # Original face crop
+                    cf = f[y1:y2, x1:x2].copy()
+                    
+                    # ============================================
+                    # QUALITY MODES
+                    # ============================================
+                    
+                    if s['quality'] == "Enhanced":
+                        # STEP 1: GFPGAN Upscale
+                        p = self._upscale(p.astype(np.uint8))
+                        
+                        # STEP 2: Resize với LANCZOS4
+                        p = cv2.resize(p, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+                        
+                        # STEP 3: Kernel Sharpening
+                        k = s['sharpen_amount']
+                        sharpen_kernel = np.array([
+                            [0, -1, 0],
+                            [-1, k + 3.5, -1],
+                            [0, -1, 0]
+                        ]) / (k + 0.5)
+                        p = cv2.filter2D(p, -1, sharpen_kernel)
+                        
+                        # STEP 4: Color Match
+                        if s['enable_color_match']:
+                            p = match_color(cf, p)
+                        
+                        # STEP 5: Mask Blending
+                        if s['mouth_tracking']:
+                            p, last_tracked_mask = create_tracked_mask(
+                                p, cf, 
+                                s['mask_dilation'], 
+                                s['mask_feathering'],
+                                last_tracked_mask
+                            )
+                        else:
+                            p, cached_mask = create_mask(
+                                p, cf,
+                                s['mask_dilation'],
+                                s['mask_feathering'],
+                                cached_mask
+                            )
+                    
+                    elif s['quality'] == "Improved":
+                        # Chỉ resize + mask
+                        p = cv2.resize(p.astype(np.uint8), (target_w, target_h))
+                        
+                        if s['mouth_tracking']:
+                            p, last_tracked_mask = create_tracked_mask(
+                                p, cf,
+                                s['mask_dilation'],
+                                s['mask_feathering'],
+                                last_tracked_mask
+                            )
+                        else:
+                            p, cached_mask = create_mask(
+                                p, cf,
+                                s['mask_dilation'],
+                                s['mask_feathering'],
+                                cached_mask
+                            )
+                    
+                    else:  # Fast
+                        p = cv2.resize(p.astype(np.uint8), (target_w, target_h))
+                    
+                    # Đảm bảo kích thước đúng
+                    if p.shape[0] != target_h or p.shape[1] != target_w:
+                        p = cv2.resize(p, (target_w, target_h))
+                    
+                    # Paste vào frame
+                    f[y1:y2, x1:x2] = p
+                    
+                    # Write frame
+                    if not s['preview_only']:
+                        out.write(f)
+                
+                # Clear batches
+                img_batch, mel_batch, frame_batch, coords_batch = [], [], [], []
+        
+        # Release video writer
         out.release()
         
-        # Merge with audio
-        if not os.path.exists("temp/result.mp4"):
-            raise FileNotFoundError("temp/result.mp4 not found")
+        # ================================================================
+        # STEP 7: MERGE AUDIO
+        # ================================================================
+        if s['preview_only']:
+            # Chỉ save 1 frame preview
+            cv2.imwrite(output_path.replace('.mp4', '.jpg'), f)
+            print(f"✅ Preview saved: {output_path.replace('.mp4', '.jpg')}")
+            return output_path.replace('.mp4', '.jpg')
         
+        print("🔊 Merging audio...")
+        
+        # Ensure temp video exists
+        if not os.path.exists(temp_video):
+            raise FileNotFoundError(f"Temp video not found: {temp_video}")
+        
+        # Convert audio to wav if needed
+        audio_wav = audio_path
+        if not audio_path.endswith('.wav'):
+            audio_wav = "temp/temp_audio.wav"
+            if not os.path.exists(audio_wav):
+                subprocess.check_call([
+                    "ffmpeg", "-y", "-loglevel", "error",
+                    "-i", audio_path, audio_wav
+                ])
+        
+        # Merge with FFmpeg
         ffmpeg_cmd = [
-            "ffmpeg", "-y",
-            "-i", "temp/result.mp4",
-            "-i", audio_path,
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", temp_video,
+            "-i", audio_wav,
             "-c:v", "libx264",
             "-preset", "medium",
             "-crf", "18",
@@ -614,188 +773,132 @@ class Wav2LipEngine:
             output_path
         ]
         
-        subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        subprocess.run(ffmpeg_cmd, check=True)
+        
+        # Cleanup temp files
+        if os.path.exists(temp_video):
+            os.remove(temp_video)
+        
+        print(f"✅ Done! Output: {output_path}")
+        print(f"   Size: {os.path.getsize(output_path) / 1024 / 1024:.2f} MB")
         
         return output_path
+    
+    def create_cache(self, video_path, cache_file, target_frames=0, 
+                     resize_height=0, pads=(0, 10, 0, 0)):
+        """
+        Tạo cache face detection cho video.
+        
+        Args:
+            video_path: Đường dẫn video
+            cache_file: Đường dẫn output cache (.pkl)
+            target_frames: Số frames cần tạo (0 = tất cả)
+            resize_height: Chiều cao resize
+            pads: Padding cho face detection
+        
+        Returns:
+            Số entries đã tạo
+        """
+        print("=" * 60)
+        print("📦 CACHE CREATION MODE")
+        print("=" * 60)
+        
+        # Load video
+        resize_h = resize_height if resize_height > 0 else None
+        frames, fps = self._load_video(video_path, resize_h)
+        
+        print(f"   Original: {len(frames)} frames")
+        print(f"   Target: {target_frames if target_frames > 0 else 'All'}")
+        
+        # Loop nếu cần
+        if target_frames > 0 and target_frames > len(frames):
+            print(f"   Looping to reach {target_frames} frames...")
+            looped = []
+            while len(looped) < target_frames:
+                looped.extend(frames)
+            frames = looped[:target_frames]
+        elif target_frames > 0:
+            frames = frames[:target_frames]
+        
+        # Delete old cache
+        if os.path.exists(cache_file):
+            os.remove(cache_file)
+            print(f"   Deleted old cache")
+        
+        # Detect faces
+        results = self._face_detect(frames, cache_file=cache_file, pads=pads)
+        
+        print("=" * 60)
+        print(f"✅ Cache created: {cache_file}")
+        print(f"   Total entries: {len(results)}")
+        print("=" * 60)
+        
+        return len(results)
 
 
 # ============================================================================
-# CACHE ONLY MODE (Tao cache doc lap)
-# ============================================================================
-
-def main_cache_only():
-    """Che do --only_detect: Chi tao cache face detection"""
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint_path", type=str, required=True)
-    parser.add_argument("--face", type=str, required=True)
-    parser.add_argument("--audio", type=str, required=True)
-    parser.add_argument("--outfile", type=str, default="master_cache.pkl")
-    parser.add_argument("--target_frames", type=int, default=0)
-    parser.add_argument("--fps", type=float, default=25.0)
-    parser.add_argument("--out_height", type=int, default=480)
-    parser.add_argument("--crop", nargs="+", type=int, default=[0, -1, 0, -1])
-    parser.add_argument("--rotate", action="store_true", default=False)
-    parser.add_argument("--pads", nargs="+", type=int, default=[0, 10, 0, 0])
-    parser.add_argument("--nosmooth", type=str, default=False)
-    parser.add_argument("--face_det_batch_size", type=int, default=16)
-    parser.add_argument("--fullres", type=int, default=3)
-    
-    args = parser.parse_args()
-    
-    print(f"\n{'='*60}")
-    print("CACHE CREATION MODE")
-    print(f"{'='*60}")
-    
-    # Initialize engine (chi de dung detector)
-    engine = Wav2LipEngine(
-        gpu_id=0,
-        checkpoint_path=args.checkpoint_path,
-        load_sr=False  # Khong can GFPGAN
-    )
-    
-    # Load video
-    settings = {
-        'fullres': args.fullres,
-        'out_height': args.out_height,
-        'rotate': args.rotate,
-        'crop': args.crop,
-        'fps': args.fps
-    }
-    
-    print("\nLoading video...")
-    full_frames, fps = engine._load_video(args.face, settings)
-    print(f"Loaded {len(full_frames)} frames")
-    
-    # Loop if needed
-    target = args.target_frames if args.target_frames > 0 else len(full_frames)
-    print(f"Target frames: {target}")
-    
-    if target > len(full_frames):
-        print(f"Looping video: {len(full_frames)} -> {target} frames...")
-        looped_frames = []
-        while len(looped_frames) < target:
-            looped_frames.extend(full_frames)
-        full_frames = looped_frames[:target]
-    else:
-        full_frames = full_frames[:target]
-    
-    # Detect faces
-    cache_file = args.outfile if args.outfile.endswith('.pkl') else "master_cache.pkl"
-    
-    if os.path.exists(cache_file):
-        os.remove(cache_file)
-        print(f"Deleted old cache: {cache_file}")
-    
-    settings['cache_file'] = cache_file
-    settings['pads'] = args.pads
-    settings['nosmooth'] = args.nosmooth
-    settings['face_det_batch_size'] = args.face_det_batch_size
-    
-    face_det_results = engine._face_detect(full_frames, settings)
-    
-    print(f"\n{'='*60}")
-    print(f"CACHE CREATED: {cache_file}")
-    print(f"Total entries: {len(face_det_results)}")
-    print(f"File size: {os.path.getsize(cache_file) / 1024:.2f} KB")
-    print(f"{'='*60}\n")
-
-
-# ============================================================================
-# CLI WRAPPER (BACKWARD COMPATIBILITY - BAO GIO CUNG CHAY DUOC)
-# ============================================================================
-
-def main_cli():
-    """
-    Wrapper cho phep goi tu command line nhu cu:
-    python inference.py --face video.mp4 --audio audio.wav ...
-    """
-    parser = argparse.ArgumentParser(
-        description="Inference code to lip-sync videos in the wild using Wav2Lip models"
-    )
-
-    parser.add_argument("--checkpoint_path", type=str, required=True)
-    parser.add_argument("--segmentation_path", type=str, default="checkpoints/face_segmentation.pth")
-    parser.add_argument("--face", type=str, required=True)
-    parser.add_argument("--audio", type=str, required=True)
-    parser.add_argument("--outfile", type=str, default="results/result_voice.mp4")
-    parser.add_argument("--static", type=bool, default=False)
-    parser.add_argument("--fps", type=float, default=25.0)
-    parser.add_argument("--pads", nargs="+", type=int, default=[0, 10, 0, 0])
-    parser.add_argument("--resize_factor", default=1, type=int)
-    parser.add_argument("--wav2lip_batch_size", type=int, default=1)
-    parser.add_argument("--face_det_batch_size", type=int, default=16)
-    parser.add_argument("--out_height", default=480, type=int)
-    parser.add_argument("--crop", nargs="+", type=int, default=[0, -1, 0, -1])
-    parser.add_argument("--box", nargs="+", type=int, default=[-1, -1, -1, -1])
-    parser.add_argument("--rotate", default=False, action="store_true")
-    parser.add_argument("--nosmooth", type=str, default=False)
-    parser.add_argument("--no_seg", default=False, action="store_true")
-    parser.add_argument("--no_sr", default=False, action="store_true")
-    parser.add_argument("--sr_model", type=str, default="gfpgan")
-    parser.add_argument("--fullres", default=3, type=int)
-    parser.add_argument("--debug_mask", type=str, default=False)
-    parser.add_argument("--preview_settings", type=str, default=False)
-    parser.add_argument("--mouth_tracking", type=str, default=False)
-    parser.add_argument("--mask_dilation", default=150, type=float)
-    parser.add_argument("--mask_feathering", default=151, type=int)
-    parser.add_argument("--quality", type=str, default="Fast")
-    parser.add_argument("--sharpen_amount", type=float, default=1.5)
-    parser.add_argument("--enable_color_match", action="store_true")
-    
-    args = parser.parse_args()
-    
-    # Convert args to settings dictionary
-    settings = {
-        'quality': args.quality,
-        'sharpen_amount': args.sharpen_amount,
-        'enable_color_match': args.enable_color_match,
-        'cache_file': 'last_detected_face.pkl',
-        'fps': args.fps,
-        'batch_size': args.wav2lip_batch_size,
-        'pads': args.pads,
-        'mask_dilation': args.mask_dilation,
-        'mask_feathering': args.mask_feathering,
-        'mouth_tracking': args.mouth_tracking,
-        'debug_mask': args.debug_mask,
-        'static': args.static,
-        'out_height': args.out_height,
-        'crop': args.crop,
-        'box': args.box,
-        'rotate': args.rotate,
-        'nosmooth': args.nosmooth,
-        'fullres': args.fullres,
-        'resize_factor': args.resize_factor,
-        'face_det_batch_size': args.face_det_batch_size,
-    }
-    
-    # Initialize engine
-    print("Initializing Wav2Lip Engine...")
-    engine = Wav2LipEngine(
-        gpu_id=0,
-        checkpoint_path=args.checkpoint_path,
-        load_sr=(args.quality == "Enhanced")
-    )
-    
-    # Process
-    print("\nProcessing video...")
-    output_path = engine.process(
-        video_path=args.face,
-        audio_path=args.audio,
-        output_path=args.outfile,
-        settings=settings
-    )
-    
-    print(f"\n*** FINAL OUTPUT: {output_path} ***\n")
-
-
-# ============================================================================
-# ENTRY POINT
+# STANDALONE USAGE (Backward compatibility)
 # ============================================================================
 
 if __name__ == "__main__":
-    if '--only_detect' in sys.argv:
-        # Che do tao cache
-        main_cache_only()
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Wav2Lip Inference")
+    parser.add_argument("--checkpoint_path", type=str, required=True)
+    parser.add_argument("--face", type=str, required=True)
+    parser.add_argument("--audio", type=str, required=True)
+    parser.add_argument("--outfile", type=str, default="results/result.mp4")
+    parser.add_argument("--quality", type=str, default="Enhanced")
+    parser.add_argument("--sharpen_amount", type=float, default=1.5)
+    parser.add_argument("--enable_color_match", action="store_true")
+    parser.add_argument("--mask_dilation", type=int, default=150)
+    parser.add_argument("--mask_feathering", type=int, default=151)
+    parser.add_argument("--mouth_tracking", action="store_true")
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--cache_file", type=str, default=None)
+    parser.add_argument("--only_detect", action="store_true")
+    parser.add_argument("--target_frames", type=int, default=0)
+    parser.add_argument("--pads", nargs="+", type=int, default=[0, 10, 0, 0])
+    parser.add_argument("--out_height", type=int, default=0)
+    parser.add_argument("--preview_settings", action="store_true")
+    
+    args = parser.parse_args()
+    
+    # Create engine
+    engine = Wav2LipEngine(
+        gpu_id=0,
+        checkpoint_path=args.checkpoint_path,
+        load_sr_model=(args.quality == "Enhanced")
+    )
+    
+    if args.only_detect:
+        # Cache creation mode
+        engine.create_cache(
+            video_path=args.face,
+            cache_file=args.cache_file or "master_cache.pkl",
+            target_frames=args.target_frames,
+            resize_height=args.out_height,
+            pads=tuple(args.pads)
+        )
     else:
-        # Che do inference binh thuong
-        main_cli()
+        # Normal processing
+        settings = {
+            'quality': args.quality,
+            'sharpen_amount': args.sharpen_amount,
+            'enable_color_match': args.enable_color_match,
+            'mask_dilation': args.mask_dilation,
+            'mask_feathering': args.mask_feathering,
+            'mouth_tracking': args.mouth_tracking,
+            'batch_size': args.batch_size,
+            'cache_file': args.cache_file,
+            'resize_height': args.out_height,
+            'pads': tuple(args.pads),
+            'preview_only': args.preview_settings,
+        }
+        
+        engine.process(
+            video_path=args.face,
+            audio_path=args.audio,
+            output_path=args.outfile,
+            settings=settings
+        )

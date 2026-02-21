@@ -1,9 +1,10 @@
 """
-Wav2LipEngine - Always-On Architecture
-=======================================
-Version: V18 Compatible
-Model được nạp 1 lần duy nhất vào VRAM.
-Gọi process() nhiều lần mà không cần reload.
+Wav2LipEngine - Always-On Architecture (Parallel GPU Safe)
+===========================================================
+Version: V18 Parallel Safe
+- Unique temp paths per process (no conflict)
+- Multi-GPU parallel processing support
+- Model loaded once, reused multiple times
 """
 
 # ============================================================================
@@ -29,6 +30,9 @@ import pickle
 
 print("\rLoading math        ", end="")
 import math
+
+print("\rLoading uuid        ", end="")
+import uuid
 
 print("\rLoading tqdm        ", end="")
 from tqdm import tqdm
@@ -120,7 +124,7 @@ def get_audio_duration(audio_path):
         audio_path
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         return float(result.stdout.strip())
     except:
         return 0.0
@@ -181,7 +185,6 @@ def create_mask(img, original_img, mask_dilation=150, mask_feathering=151, cache
         mask_to_use = cv2.resize(cached_mask, (img.shape[1], img.shape[0]))
     else:
         if mouth_detector is None or predictor is None:
-            # Fallback: trả về ảnh gốc nếu không có detector
             return img, None
         
         faces = mouth_detector(img)
@@ -197,13 +200,11 @@ def create_mask(img, original_img, mask_dilation=150, mask_feathering=151, cache
         mask = np.zeros(img.shape[:2], dtype=np.uint8)
         cv2.fillConvexPoly(mask, mouth_points, 255)
         
-        # Dilation
         kernel_size = int(max(w, h) * mask_dilation / 100)
         kernel_size = max(1, kernel_size)
         kernel = np.ones((kernel_size, kernel_size), np.uint8)
         dilated_mask = cv2.dilate(mask, kernel)
         
-        # Feathering (Gaussian Blur)
         if mask_feathering > 0:
             blur = int(max(w, h) * mask_feathering / 100)
             blur = blur if blur % 2 == 1 else blur + 1
@@ -212,7 +213,6 @@ def create_mask(img, original_img, mask_dilation=150, mask_feathering=151, cache
         else:
             mask_to_use = dilated_mask
     
-    # Blend using Numpy (No-PIL)
     mask_3ch = cv2.cvtColor(mask_to_use, cv2.COLOR_GRAY2BGR).astype(np.float32) / 255.0
     out = (img.astype(np.float32) * mask_3ch + original_img.astype(np.float32) * (1 - mask_3ch))
     out = np.clip(out, 0, 255).astype(np.uint8)
@@ -253,7 +253,6 @@ def create_tracked_mask(img, original_img, mask_dilation=150, mask_feathering=15
         mouth_points = np.array([[shape.part(i).x, shape.part(i).y] for i in range(48, 68)])
         x, y, w, h = cv2.boundingRect(mouth_points)
         
-        # Dilation
         kernel_size = int(max(w, h) * mask_dilation / 100)
         kernel_size = max(1, kernel_size)
         kernel = np.ones((kernel_size, kernel_size), np.uint8)
@@ -262,7 +261,6 @@ def create_tracked_mask(img, original_img, mask_dilation=150, mask_feathering=15
         cv2.fillConvexPoly(mask, mouth_points, 255)
         dilated_mask = cv2.dilate(mask, kernel)
         
-        # Feathering
         blur = int(max(w, h) * mask_feathering / 100)
         blur = blur if blur % 2 == 1 else blur + 1
         blur = max(1, blur)
@@ -303,8 +301,9 @@ def get_smoothened_boxes(boxes, T=5):
 
 class Wav2LipEngine:
     """
-    Always-On Wav2Lip Engine.
+    Always-On Wav2Lip Engine - Parallel GPU Safe.
     Load models 1 lần, gọi process() nhiều lần.
+    Mỗi process() sử dụng temp path riêng biệt để tránh conflict.
     """
     
     def __init__(self, gpu_id=0, checkpoint_path="checkpoints/wav2lip.pth", load_sr_model=True):
@@ -316,6 +315,9 @@ class Wav2LipEngine:
             checkpoint_path: Đường dẫn tới model Wav2Lip
             load_sr_model: Có nạp GFPGAN không
         """
+        # Lưu GPU ID để tạo unique temp paths
+        self.engine_id = gpu_id
+        
         # Xác định device
         if torch.cuda.is_available():
             self.device = f'cuda:{gpu_id}'
@@ -353,11 +355,11 @@ class Wav2LipEngine:
             self.sr_model = self._load_sr()
             print(f"   ✅ GFPGAN loaded!")
         
-        print(f"✅ Wav2LipEngine Ready on {self.device}!")
+        print(f"✅ Wav2LipEngine {gpu_id} Ready on {self.device}!")
     
     def _load_sr(self):
-        """Load GFPGAN model."""
-        sr_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        """Load GFPGAN model lên đúng GPU."""
+        sr_device = f'cuda:{self.gpu_id}' if torch.cuda.is_available() and self.gpu_id >= 0 else 'cpu'
         return GFPGANer(
             model_path="checkpoints/GFPGANv1.4.pth",
             upscale=1,
@@ -461,6 +463,9 @@ class Wav2LipEngine:
         # Save cache
         if cache_file:
             try:
+                cache_dir = os.path.dirname(cache_file)
+                if cache_dir:
+                    os.makedirs(cache_dir, exist_ok=True)
                 with open(cache_file, "wb") as f:
                     pickle.dump(final_results, f)
                 print(f"   💾 Saved cache: {len(final_results)} entries -> {cache_file}")
@@ -537,16 +542,22 @@ class Wav2LipEngine:
         Returns:
             List of mel chunks
         """
+        # ✅ UNIQUE TEMP PATH PER ENGINE - Tránh conflict khi parallel
+        unique_id = uuid.uuid4().hex[:8]
+        temp_wav = f"temp/audio_{self.engine_id}_{unique_id}.wav"
+        os.makedirs("temp", exist_ok=True)
+        
+        need_cleanup = False
+        
         # Convert to wav if needed
         if not audio_path.endswith('.wav'):
             print("🔊 Converting audio to WAV...")
-            wav_path = "temp/temp_audio.wav"
-            os.makedirs("temp", exist_ok=True)
-            subprocess.check_call([
+            subprocess.run([
                 "ffmpeg", "-y", "-loglevel", "error",
-                "-i", audio_path, "-ac", "1", "-ar", "16000", wav_path
-            ])
-            audio_path = wav_path
+                "-i", audio_path, "-ac", "1", "-ar", "16000", temp_wav
+            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            audio_path = temp_wav
+            need_cleanup = True
         
         print("🔊 Analyzing audio...")
         wav = audio.load_wav(audio_path, 16000)
@@ -566,6 +577,13 @@ class Wav2LipEngine:
                 break
             mel_chunks.append(mel[:, start_idx : start_idx + MEL_STEP_SIZE])
             i += 1
+        
+        # Cleanup temp wav
+        if need_cleanup and os.path.exists(temp_wav):
+            try:
+                os.remove(temp_wav)
+            except:
+                pass
         
         print(f"   ✅ Created {len(mel_chunks)} mel chunks")
         return mel_chunks
@@ -599,6 +617,7 @@ class Wav2LipEngine:
     def process(self, video_path, audio_path, output_path, settings=None):
         """
         Xử lý lip-sync cho video.
+        ✅ PARALLEL SAFE: Mỗi process dùng temp path riêng
         
         Args:
             video_path: Đường dẫn video input
@@ -626,8 +645,8 @@ class Wav2LipEngine:
         # Default settings
         s = {
             'quality': 'Enhanced',
-            'sharpen_amount': 1.5,
-            'enable_color_match': True,
+            'sharpen_amount': 0,
+            'enable_color_match': False,
             'mask_dilation': 150,
             'mask_feathering': 75,
             'mouth_tracking': False,
@@ -646,13 +665,14 @@ class Wav2LipEngine:
             s.update(settings)
         
         print("=" * 60)
-        print("🎬 WAV2LIP PROCESSING")
+        print(f"🎬 WAV2LIP PROCESSING [GPU {self.engine_id}]")
         print("=" * 60)
         print(f"   Quality: {s['quality']}")
         print(f"   Sharpen: {s['sharpen_amount']}")
         print(f"   Color Match: {s['enable_color_match']}")
         print(f"   Mask: dilation={s['mask_dilation']}, feather={s['mask_feathering']}")
         print(f"   Mouth Tracking: {s['mouth_tracking']}")
+        print(f"   Batch Size: {s['batch_size']}")
         print("=" * 60)
         
         try:
@@ -717,11 +737,20 @@ class Wav2LipEngine:
                 raise ValueError("No frames to process after sync!")
             
             # ================================================================
-            # STEP 5: SETUP OUTPUT VIDEO
+            # STEP 5: SETUP OUTPUT VIDEO - ✅ UNIQUE TEMP PATH
             # ================================================================
             frame_h, frame_w = full_frames[0].shape[:2]
-            temp_video = "temp/result_temp.mp4"
-            os.makedirs("temp", exist_ok=True)
+            
+            # ✅ UNIQUE TEMP FILE PER PROCESS - Tránh conflict khi parallel
+            unique_id = uuid.uuid4().hex[:8]
+            output_dir = os.path.dirname(output_path)
+            if output_dir:
+                temp_dir = output_dir
+            else:
+                temp_dir = "temp"
+            os.makedirs(temp_dir, exist_ok=True)
+            
+            temp_video = os.path.join(temp_dir, f"temp_{self.engine_id}_{unique_id}.mp4")
             
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             out = cv2.VideoWriter(temp_video, fourcc, fps, (frame_w, frame_h))
@@ -869,6 +898,12 @@ class Wav2LipEngine:
                 preview_path = output_path.replace('.mp4', '_preview.jpg')
                 cv2.imwrite(preview_path, f)
                 print(f"✅ Preview saved: {preview_path}")
+                # Cleanup temp
+                if os.path.exists(temp_video):
+                    try:
+                        os.remove(temp_video)
+                    except:
+                        pass
                 return preview_path
             
             # ================================================================
@@ -880,7 +915,9 @@ class Wav2LipEngine:
                 raise FileNotFoundError(f"Temp video not found: {temp_video}")
             
             # Ensure output directory exists
-            os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
+            output_dir = os.path.dirname(output_path)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
             
             # Merge with FFmpeg
             ffmpeg_cmd = [
@@ -888,7 +925,7 @@ class Wav2LipEngine:
                 "-i", temp_video,
                 "-i", audio_path,
                 "-c:v", "libx264",
-                "-preset", "medium",
+                "-preset", "fast",
                 "-crf", "18",
                 "-c:a", "aac",
                 "-b:a", "192k",
@@ -896,11 +933,14 @@ class Wav2LipEngine:
                 output_path
             ]
             
-            subprocess.run(ffmpeg_cmd, check=True)
+            subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             
             # Cleanup temp
             if os.path.exists(temp_video):
-                os.remove(temp_video)
+                try:
+                    os.remove(temp_video)
+                except:
+                    pass
             
             if os.path.exists(output_path):
                 file_size = os.path.getsize(output_path) / (1024 * 1024)
@@ -980,7 +1020,7 @@ if __name__ == "__main__":
     parser.add_argument("--audio", type=str, required=True, help="Audio file")
     parser.add_argument("--outfile", type=str, default="results/result.mp4", help="Output path")
     parser.add_argument("--quality", type=str, default="Enhanced", choices=["Fast", "Improved", "Enhanced"])
-    parser.add_argument("--sharpen_amount", type=float, default=1.5)
+    parser.add_argument("--sharpen_amount", type=float, default=0)
     parser.add_argument("--enable_color_match", action="store_true")
     parser.add_argument("--mask_dilation", type=int, default=150)
     parser.add_argument("--mask_feathering", type=int, default=75)

@@ -1,6 +1,7 @@
 """
 Wav2LipEngine - Always-On Architecture
 =======================================
+Version: V18 Compatible
 Model được nạp 1 lần duy nhất vào VRAM.
 Gọi process() nhiều lần mà không cần reload.
 """
@@ -52,17 +53,25 @@ from easy_functions import load_model
 
 print("\rImports loaded!     ")
 
+
 # ============================================================================
-# LOAD PREDICTORS (Dlib) - Chỉ load 1 lần khi import module
+# LOAD PREDICTORS (Dlib) - Load 1 lần khi import module
 # ============================================================================
 print("Loading face predictors...")
-with open(os.path.join("checkpoints", "predictor.pkl"), "rb") as f:
-    predictor = pickle.load(f)
 
-with open(os.path.join("checkpoints", "mouth_detector.pkl"), "rb") as f:
-    mouth_detector = pickle.load(f)
+predictor = None
+mouth_detector = None
 
-print("Predictors loaded!")
+try:
+    with open(os.path.join("checkpoints", "predictor.pkl"), "rb") as f:
+        predictor = pickle.load(f)
+    with open(os.path.join("checkpoints", "mouth_detector.pkl"), "rb") as f:
+        mouth_detector = pickle.load(f)
+    print("✅ Predictors loaded!")
+except Exception as e:
+    print(f"⚠️ Warning: Could not load predictors: {e}")
+    print("   Masking features may not work properly.")
+
 
 # ============================================================================
 # CONSTANTS
@@ -72,13 +81,62 @@ IMG_SIZE = 96
 
 
 # ============================================================================
-# HELPER FUNCTIONS (Giữ nguyên các hàm đã tối ưu)
+# HELPER FUNCTIONS - Export cho Cell 2 sử dụng
 # ============================================================================
+
+def get_video_info(video_path):
+    """
+    Lấy thông tin video: fps, total_frames, width, height
+    
+    Args:
+        video_path: Đường dẫn video
+    
+    Returns:
+        tuple: (fps, total_frames, width, height)
+    """
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    return fps, total_frames, width, height
+
+
+def get_audio_duration(audio_path):
+    """
+    Lấy độ dài audio bằng ffprobe (giây)
+    
+    Args:
+        audio_path: Đường dẫn file audio
+    
+    Returns:
+        float: Độ dài tính bằng giây
+    """
+    cmd = [
+        'ffprobe', '-v', 'error',
+        '-show_entries', 'format=duration',
+        '-of', 'default=noprint_wrappers=1:nokey=1',
+        audio_path
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        return float(result.stdout.strip())
+    except:
+        return 0.0
+
 
 def match_color(target, source):
     """
     Ép màu ảnh source theo màu ảnh target.
     Dùng không gian màu Lab để giữ độ tự nhiên.
+    
+    Args:
+        target: Ảnh gốc (màu chuẩn)
+        source: Ảnh AI (cần điều chỉnh màu)
+    
+    Returns:
+        Ảnh source đã được điều chỉnh màu
     """
     if target.shape != source.shape:
         source = cv2.resize(source, (target.shape[1], target.shape[0]))
@@ -106,11 +164,26 @@ def match_color(target, source):
 def create_mask(img, original_img, mask_dilation=150, mask_feathering=151, cached_mask=None):
     """
     Tạo mask vùng miệng bằng Numpy (No-PIL).
-    Trả về (blended_image, mask) để có thể cache mask.
+    
+    Args:
+        img: Ảnh AI (đã xử lý)
+        original_img: Ảnh gốc
+        mask_dilation: Độ mở rộng mask (pixels)
+        mask_feathering: Độ mờ viền mask
+        cached_mask: Mask đã cache (nếu có)
+    
+    Returns:
+        tuple: (blended_image, mask)
     """
+    global predictor, mouth_detector
+    
     if cached_mask is not None:
         mask_to_use = cv2.resize(cached_mask, (img.shape[1], img.shape[0]))
     else:
+        if mouth_detector is None or predictor is None:
+            # Fallback: trả về ảnh gốc nếu không có detector
+            return img, None
+        
         faces = mouth_detector(img)
         if len(faces) == 0:
             return img, None
@@ -124,18 +197,17 @@ def create_mask(img, original_img, mask_dilation=150, mask_feathering=151, cache
         mask = np.zeros(img.shape[:2], dtype=np.uint8)
         cv2.fillConvexPoly(mask, mouth_points, 255)
         
+        # Dilation
         kernel_size = int(max(w, h) * mask_dilation / 100)
-        if kernel_size < 1:
-            kernel_size = 1
+        kernel_size = max(1, kernel_size)
         kernel = np.ones((kernel_size, kernel_size), np.uint8)
         dilated_mask = cv2.dilate(mask, kernel)
         
+        # Feathering (Gaussian Blur)
         if mask_feathering > 0:
             blur = int(max(w, h) * mask_feathering / 100)
-            if blur % 2 == 0:
-                blur += 1
-            if blur < 1:
-                blur = 1
+            blur = blur if blur % 2 == 1 else blur + 1
+            blur = max(1, blur)
             mask_to_use = cv2.GaussianBlur(dilated_mask, (blur, blur), 0)
         else:
             mask_to_use = dilated_mask
@@ -151,7 +223,22 @@ def create_mask(img, original_img, mask_dilation=150, mask_feathering=151, cache
 def create_tracked_mask(img, original_img, mask_dilation=150, mask_feathering=151, last_mask=None):
     """
     Tạo mask với tracking miệng theo từng frame.
+    
+    Args:
+        img: Ảnh AI
+        original_img: Ảnh gốc
+        mask_dilation: Độ mở rộng mask
+        mask_feathering: Độ mờ viền
+        last_mask: Mask frame trước (fallback)
+    
+    Returns:
+        tuple: (blended_image, new_mask)
     """
+    global predictor, mouth_detector
+    
+    if mouth_detector is None or predictor is None:
+        return img, last_mask
+    
     faces = mouth_detector(img)
     
     if len(faces) == 0:
@@ -166,20 +253,19 @@ def create_tracked_mask(img, original_img, mask_dilation=150, mask_feathering=15
         mouth_points = np.array([[shape.part(i).x, shape.part(i).y] for i in range(48, 68)])
         x, y, w, h = cv2.boundingRect(mouth_points)
         
+        # Dilation
         kernel_size = int(max(w, h) * mask_dilation / 100)
-        if kernel_size < 1:
-            kernel_size = 1
+        kernel_size = max(1, kernel_size)
         kernel = np.ones((kernel_size, kernel_size), np.uint8)
         
         mask = np.zeros(img.shape[:2], dtype=np.uint8)
         cv2.fillConvexPoly(mask, mouth_points, 255)
         dilated_mask = cv2.dilate(mask, kernel)
         
+        # Feathering
         blur = int(max(w, h) * mask_feathering / 100)
-        if blur % 2 == 0:
-            blur += 1
-        if blur < 1:
-            blur = 1
+        blur = blur if blur % 2 == 1 else blur + 1
+        blur = max(1, blur)
         
         mask_to_use = cv2.GaussianBlur(dilated_mask, (blur, blur), 0)
     
@@ -191,7 +277,16 @@ def create_tracked_mask(img, original_img, mask_dilation=150, mask_feathering=15
 
 
 def get_smoothened_boxes(boxes, T=5):
-    """Làm mượt bounding boxes."""
+    """
+    Làm mượt bounding boxes qua các frame.
+    
+    Args:
+        boxes: Array của bounding boxes
+        T: Window size cho smoothing
+    
+    Returns:
+        Array đã smooth
+    """
     smoothed = []
     for i in range(len(boxes)):
         start = max(0, i - T // 2)
@@ -236,7 +331,7 @@ class Wav2LipEngine:
         print(f"🔌 Initializing Wav2LipEngine on {self.device}...")
         
         # Load Wav2Lip model
-        print(f"   Loading Wav2Lip model...")
+        print(f"   Loading Wav2Lip model from {checkpoint_path}...")
         self.model = load_model(checkpoint_path)
         self.model = self.model.to(self.device)
         self.model.eval()
@@ -283,7 +378,9 @@ class Wav2LipEngine:
                 only_center_face=False,
                 paste_back=False
             )
-            return restored_faces[0]
+            if restored_faces and len(restored_faces) > 0:
+                return restored_faces[0]
+            return image
         except Exception as e:
             print(f"⚠️ Upscale error: {e}")
             return image
@@ -321,10 +418,13 @@ class Wav2LipEngine:
         # Check cache
         if cache_file and os.path.exists(cache_file):
             print(f"📦 Loading face cache: {cache_file}")
-            with open(cache_file, "rb") as f:
-                cached = pickle.load(f)
-            print(f"   ✅ Loaded {len(cached)} cached entries")
-            return cached
+            try:
+                with open(cache_file, "rb") as f:
+                    cached = pickle.load(f)
+                print(f"   ✅ Loaded {len(cached)} cached entries")
+                return cached
+            except Exception as e:
+                print(f"   ⚠️ Cache load failed: {e}, detecting faces...")
         
         print(f"🔍 Detecting faces for {len(images)} frames...")
         results = []
@@ -360,9 +460,12 @@ class Wav2LipEngine:
         
         # Save cache
         if cache_file:
-            with open(cache_file, "wb") as f:
-                pickle.dump(final_results, f)
-            print(f"   💾 Saved cache: {len(final_results)} entries -> {cache_file}")
+            try:
+                with open(cache_file, "wb") as f:
+                    pickle.dump(final_results, f)
+                print(f"   💾 Saved cache: {len(final_results)} entries -> {cache_file}")
+            except Exception as e:
+                print(f"   ⚠️ Cache save failed: {e}")
         
         return final_results
     
@@ -372,14 +475,14 @@ class Wav2LipEngine:
         
         Args:
             video_path: Đường dẫn video hoặc ảnh
-            resize_height: Chiều cao resize (None = giữ nguyên)
+            resize_height: Chiều cao resize (None/0 = giữ nguyên)
             crop: Tuple (y1, y2, x1, x2) để crop
         
         Returns:
             (frames, fps)
         """
         # Check if image
-        if video_path.lower().endswith(('.jpg', '.png', '.jpeg')):
+        if video_path.lower().endswith(('.jpg', '.png', '.jpeg', '.bmp')):
             frame = cv2.imread(video_path)
             if frame is None:
                 raise ValueError(f"Cannot read image: {video_path}")
@@ -387,6 +490,9 @@ class Wav2LipEngine:
         
         # Load video
         video = cv2.VideoCapture(video_path)
+        if not video.isOpened():
+            raise ValueError(f"Cannot open video: {video_path}")
+        
         fps = video.get(cv2.CAP_PROP_FPS)
         
         frames = []
@@ -398,7 +504,8 @@ class Wav2LipEngine:
             # Resize
             if resize_height and resize_height > 0:
                 aspect = frame.shape[1] / frame.shape[0]
-                frame = cv2.resize(frame, (int(resize_height * aspect), resize_height))
+                new_width = int(resize_height * aspect)
+                frame = cv2.resize(frame, (new_width, resize_height))
             
             # Crop
             if crop:
@@ -412,12 +519,20 @@ class Wav2LipEngine:
             frames.append(frame)
         
         video.release()
+        
+        if len(frames) == 0:
+            raise ValueError(f"No frames loaded from video: {video_path}")
+        
         print(f"📹 Loaded {len(frames)} frames at {fps:.2f} FPS")
         return frames, fps
     
     def _load_audio(self, audio_path, fps):
         """
         Load audio và tạo mel spectrogram chunks.
+        
+        Args:
+            audio_path: Đường dẫn audio
+            fps: FPS của video
         
         Returns:
             List of mel chunks
@@ -426,9 +541,10 @@ class Wav2LipEngine:
         if not audio_path.endswith('.wav'):
             print("🔊 Converting audio to WAV...")
             wav_path = "temp/temp_audio.wav"
+            os.makedirs("temp", exist_ok=True)
             subprocess.check_call([
                 "ffmpeg", "-y", "-loglevel", "error",
-                "-i", audio_path, wav_path
+                "-i", audio_path, "-ac", "1", "-ar", "16000", wav_path
             ])
             audio_path = wav_path
         
@@ -459,7 +575,7 @@ class Wav2LipEngine:
         Chuẩn bị batch cho inference.
         
         Returns:
-            (img_batch, mel_batch) as torch tensors on device
+            (img_tensor, mel_tensor) on device
         """
         img_batch = np.asarray(faces)
         mel_batch = np.asarray(mels)
@@ -490,10 +606,10 @@ class Wav2LipEngine:
             output_path: Đường dẫn video output
             settings: Dictionary chứa các tham số:
                 - quality: "Fast" | "Improved" | "Enhanced"
-                - sharpen_amount: float (1.0 - 3.0)
+                - sharpen_amount: float (0.0 - 3.0)
                 - enable_color_match: bool
-                - mask_dilation: int (50 - 200)
-                - mask_feathering: int (50 - 200)
+                - mask_dilation: int (50 - 300)
+                - mask_feathering: int (0 - 150)
                 - mouth_tracking: bool
                 - batch_size: int
                 - resize_height: int (0 = no resize)
@@ -502,10 +618,10 @@ class Wav2LipEngine:
                 - cache_file: str (path to cache .pkl)
                 - smooth_boxes: bool
                 - debug_mask: bool
-                - preview_only: bool (chỉ xử lý 1 frame)
+                - preview_only: bool
         
         Returns:
-            output_path nếu thành công
+            output_path nếu thành công, None nếu thất bại
         """
         # Default settings
         s = {
@@ -513,9 +629,9 @@ class Wav2LipEngine:
             'sharpen_amount': 1.5,
             'enable_color_match': True,
             'mask_dilation': 150,
-            'mask_feathering': 151,
+            'mask_feathering': 75,
             'mouth_tracking': False,
-            'batch_size': 1,
+            'batch_size': 16,
             'resize_height': 0,
             'crop': (0, -1, 0, -1),
             'pads': (0, 10, 0, 0),
@@ -535,254 +651,269 @@ class Wav2LipEngine:
         print(f"   Quality: {s['quality']}")
         print(f"   Sharpen: {s['sharpen_amount']}")
         print(f"   Color Match: {s['enable_color_match']}")
-        print(f"   Mask Dilation: {s['mask_dilation']}")
-        print(f"   Mask Feathering: {s['mask_feathering']}")
+        print(f"   Mask: dilation={s['mask_dilation']}, feather={s['mask_feathering']}")
+        print(f"   Mouth Tracking: {s['mouth_tracking']}")
         print("=" * 60)
         
-        # ================================================================
-        # STEP 1: LOAD VIDEO
-        # ================================================================
-        resize_h = s['resize_height'] if s['resize_height'] > 0 else None
-        full_frames, fps = self._load_video(video_path, resize_h, s['crop'])
-        
-        if s['preview_only']:
-            full_frames = [full_frames[0]]
-        
-        # ================================================================
-        # STEP 2: LOAD AUDIO
-        # ================================================================
-        mel_chunks = self._load_audio(audio_path, fps)
-        
-        if s['preview_only']:
-            mel_chunks = [mel_chunks[0]]
-        
-        # ================================================================
-        # STEP 3: SYNC VIDEO & AUDIO LENGTH
-        # ================================================================
-        print(f"📊 Sync Info:")
-        print(f"   Video: {len(full_frames)} frames")
-        print(f"   Audio: {len(mel_chunks)} mel chunks")
-        
-        if len(mel_chunks) > len(full_frames):
-            print("   ⚠️ Audio longer than video - Looping video...")
-            original_len = len(full_frames)
-            looped_frames = []
-            while len(looped_frames) < len(mel_chunks):
-                looped_frames.extend(full_frames)
-            full_frames = looped_frames[:len(mel_chunks)]
-            print(f"   ✅ Looped: {original_len} -> {len(full_frames)} frames")
-        else:
-            full_frames = full_frames[:len(mel_chunks)]
-            print(f"   ✅ Trimmed to: {len(full_frames)} frames")
-        
-        # ================================================================
-        # STEP 4: FACE DETECTION (với Cache)
-        # ================================================================
-        face_det_results = self._face_detect(
-            full_frames,
-            cache_file=s['cache_file'],
-            pads=s['pads'],
-            batch_size=s['batch_size'],
-            smooth=s['smooth_boxes']
-        )
-        
-        # ================================================================
-        # SYNC FIX: Đảm bảo frames và cache khớp nhau
-        # ================================================================
-        num_synced = min(len(full_frames), len(face_det_results), len(mel_chunks))
-        full_frames = full_frames[:num_synced]
-        face_det_results = face_det_results[:num_synced]
-        mel_chunks = mel_chunks[:num_synced]
-        
-        print(f"   🔄 Synced to: {num_synced} frames")
-        
-        # ================================================================
-        # STEP 5: SETUP OUTPUT VIDEO
-        # ================================================================
-        frame_h, frame_w = full_frames[0].shape[:2]
-        temp_video = "temp/result_temp.mp4"
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        out = cv2.VideoWriter(temp_video, fourcc, fps, (frame_w, frame_h))
-        
-        # ================================================================
-        # STEP 6: INFERENCE LOOP
-        # ================================================================
-        print(f"🚀 Processing {num_synced} frames...")
-        
-        # Cache cho mask (nếu không tracking)
-        cached_mask = None
-        last_tracked_mask = None
-        
-        # Process theo batch
-        batch_size = s['batch_size']
-        
-        img_batch, mel_batch, frame_batch, coords_batch = [], [], [], []
-        
-        for idx, mel in enumerate(tqdm(mel_chunks, desc="Processing", ncols=100)):
-            frame = full_frames[idx].copy()
-            face, coords = face_det_results[idx]
+        try:
+            # ================================================================
+            # STEP 1: LOAD VIDEO
+            # ================================================================
+            resize_h = s['resize_height'] if s['resize_height'] > 0 else None
+            full_frames, fps = self._load_video(video_path, resize_h, s['crop'])
             
-            # Resize face to model input size
-            face_resized = cv2.resize(face.copy(), (IMG_SIZE, IMG_SIZE))
+            if s['preview_only']:
+                full_frames = [full_frames[0]]
             
-            img_batch.append(face_resized)
-            mel_batch.append(mel)
-            frame_batch.append(frame)
-            coords_batch.append(coords)
+            # ================================================================
+            # STEP 2: LOAD AUDIO
+            # ================================================================
+            mel_chunks = self._load_audio(audio_path, fps)
             
-            # Process khi đủ batch
-            if len(img_batch) >= batch_size or idx == len(mel_chunks) - 1:
-                # Prepare batch
-                img_tensor, mel_tensor = self._prepare_batch(img_batch, mel_batch)
+            if s['preview_only']:
+                mel_chunks = [mel_chunks[0]]
+            
+            # ================================================================
+            # STEP 3: SYNC VIDEO & AUDIO LENGTH
+            # ================================================================
+            print(f"📊 Sync Info:")
+            print(f"   Video: {len(full_frames)} frames")
+            print(f"   Audio: {len(mel_chunks)} mel chunks")
+            
+            if len(mel_chunks) > len(full_frames):
+                print("   ⚠️ Audio longer than video - Looping video...")
+                original_len = len(full_frames)
+                looped_frames = []
+                while len(looped_frames) < len(mel_chunks):
+                    looped_frames.extend(full_frames)
+                full_frames = looped_frames[:len(mel_chunks)]
+                print(f"   ✅ Looped: {original_len} -> {len(full_frames)} frames")
+            else:
+                full_frames = full_frames[:len(mel_chunks)]
+                print(f"   ✅ Trimmed to: {len(full_frames)} frames")
+            
+            # ================================================================
+            # STEP 4: FACE DETECTION (với Cache)
+            # ================================================================
+            face_det_results = self._face_detect(
+                full_frames,
+                cache_file=s['cache_file'],
+                pads=s['pads'],
+                batch_size=s['batch_size'],
+                smooth=s['smooth_boxes']
+            )
+            
+            # ================================================================
+            # SYNC FIX: Đảm bảo frames, cache, mel khớp nhau
+            # ================================================================
+            num_synced = min(len(full_frames), len(face_det_results), len(mel_chunks))
+            full_frames = full_frames[:num_synced]
+            face_det_results = face_det_results[:num_synced]
+            mel_chunks = mel_chunks[:num_synced]
+            
+            print(f"   🔄 Synced to: {num_synced} frames")
+            
+            if num_synced == 0:
+                raise ValueError("No frames to process after sync!")
+            
+            # ================================================================
+            # STEP 5: SETUP OUTPUT VIDEO
+            # ================================================================
+            frame_h, frame_w = full_frames[0].shape[:2]
+            temp_video = "temp/result_temp.mp4"
+            os.makedirs("temp", exist_ok=True)
+            
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            out = cv2.VideoWriter(temp_video, fourcc, fps, (frame_w, frame_h))
+            
+            # ================================================================
+            # STEP 6: INFERENCE LOOP
+            # ================================================================
+            print(f"🚀 Processing {num_synced} frames...")
+            
+            # Cache cho mask
+            cached_mask = None
+            last_tracked_mask = None
+            
+            # Batch processing
+            batch_size = min(s['batch_size'], 128)  # Cap batch size
+            img_batch, mel_batch, frame_batch, coords_batch = [], [], [], []
+            
+            for idx, mel in enumerate(tqdm(mel_chunks, desc="Processing", ncols=100)):
+                frame = full_frames[idx].copy()
+                face, coords = face_det_results[idx]
                 
-                # Inference
-                with torch.no_grad():
-                    pred = self.model(mel_tensor, img_tensor)
+                # Resize face to model input size
+                face_resized = cv2.resize(face.copy(), (IMG_SIZE, IMG_SIZE))
                 
-                pred = pred.cpu().numpy().transpose(0, 2, 3, 1) * 255.0
+                img_batch.append(face_resized)
+                mel_batch.append(mel)
+                frame_batch.append(frame)
+                coords_batch.append(coords)
                 
-                # Process each prediction
-                for p, f, c in zip(pred, frame_batch, coords_batch):
-                    y1, y2, x1, x2 = c
-                    target_h = y2 - y1
-                    target_w = x2 - x1
+                # Process khi đủ batch hoặc cuối cùng
+                if len(img_batch) >= batch_size or idx == len(mel_chunks) - 1:
+                    # Prepare batch
+                    img_tensor, mel_tensor = self._prepare_batch(img_batch, mel_batch)
                     
-                    # Debug mask mode
-                    if s['debug_mask']:
-                        f = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
-                        f = cv2.cvtColor(f, cv2.COLOR_GRAY2BGR)
+                    # Inference
+                    with torch.no_grad():
+                        pred = self.model(mel_tensor, img_tensor)
                     
-                    # Original face crop
-                    cf = f[y1:y2, x1:x2].copy()
+                    pred = pred.cpu().numpy().transpose(0, 2, 3, 1) * 255.0
                     
-                    # ============================================
-                    # QUALITY MODES
-                    # ============================================
-                    
-                    if s['quality'] == "Enhanced":
-                        # STEP 1: GFPGAN Upscale
-                        p = self._upscale(p.astype(np.uint8))
+                    # Process each prediction
+                    for p, f, c in zip(pred, frame_batch, coords_batch):
+                        y1, y2, x1, x2 = c
+                        target_h = y2 - y1
+                        target_w = x2 - x1
                         
-                        # STEP 2: Resize với LANCZOS4
-                        p = cv2.resize(p, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+                        # Skip invalid regions
+                        if target_h <= 0 or target_w <= 0:
+                            out.write(f)
+                            continue
                         
-                        # STEP 3: Kernel Sharpening
-                        k = s['sharpen_amount']
-                        sharpen_kernel = np.array([
-                            [0, -1, 0],
-                            [-1, k + 3.5, -1],
-                            [0, -1, 0]
-                        ]) / (k + 0.5)
-                        p = cv2.filter2D(p, -1, sharpen_kernel)
+                        # Debug mask mode
+                        if s['debug_mask']:
+                            f = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+                            f = cv2.cvtColor(f, cv2.COLOR_GRAY2BGR)
                         
-                        # STEP 4: Color Match
-                        if s['enable_color_match']:
-                            p = match_color(cf, p)
+                        # Original face crop
+                        cf = f[y1:y2, x1:x2].copy()
                         
-                        # STEP 5: Mask Blending
-                        if s['mouth_tracking']:
-                            p, last_tracked_mask = create_tracked_mask(
-                                p, cf, 
-                                s['mask_dilation'], 
-                                s['mask_feathering'],
-                                last_tracked_mask
-                            )
-                        else:
-                            p, cached_mask = create_mask(
-                                p, cf,
-                                s['mask_dilation'],
-                                s['mask_feathering'],
-                                cached_mask
-                            )
-                    
-                    elif s['quality'] == "Improved":
-                        # Chỉ resize + mask
-                        p = cv2.resize(p.astype(np.uint8), (target_w, target_h))
+                        # ====================================================
+                        # QUALITY MODES
+                        # ====================================================
                         
-                        if s['mouth_tracking']:
-                            p, last_tracked_mask = create_tracked_mask(
-                                p, cf,
-                                s['mask_dilation'],
-                                s['mask_feathering'],
-                                last_tracked_mask
-                            )
-                        else:
-                            p, cached_mask = create_mask(
-                                p, cf,
-                                s['mask_dilation'],
-                                s['mask_feathering'],
-                                cached_mask
-                            )
+                        if s['quality'] == "Enhanced" and self.sr_model is not None:
+                            # STEP 1: GFPGAN Upscale
+                            p = self._upscale(p.astype(np.uint8))
+                            
+                            # STEP 2: Resize với LANCZOS4
+                            p = cv2.resize(p, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+                            
+                            # STEP 3: Kernel Sharpening
+                            if s['sharpen_amount'] > 0:
+                                k = s['sharpen_amount']
+                                sharpen_kernel = np.array([
+                                    [0, -1, 0],
+                                    [-1, k + 3.5, -1],
+                                    [0, -1, 0]
+                                ]) / (k + 0.5)
+                                p = cv2.filter2D(p, -1, sharpen_kernel)
+                                p = np.clip(p, 0, 255).astype(np.uint8)
+                            
+                            # STEP 4: Color Match
+                            if s['enable_color_match']:
+                                p = match_color(cf, p)
+                            
+                            # STEP 5: Mask Blending
+                            if s['mouth_tracking']:
+                                p, last_tracked_mask = create_tracked_mask(
+                                    p, cf, 
+                                    s['mask_dilation'], 
+                                    s['mask_feathering'],
+                                    last_tracked_mask
+                                )
+                            else:
+                                p, cached_mask = create_mask(
+                                    p, cf,
+                                    s['mask_dilation'],
+                                    s['mask_feathering'],
+                                    cached_mask
+                                )
+                        
+                        elif s['quality'] == "Improved":
+                            # Resize + mask only
+                            p = cv2.resize(p.astype(np.uint8), (target_w, target_h))
+                            
+                            if s['mouth_tracking']:
+                                p, last_tracked_mask = create_tracked_mask(
+                                    p, cf,
+                                    s['mask_dilation'],
+                                    s['mask_feathering'],
+                                    last_tracked_mask
+                                )
+                            else:
+                                p, cached_mask = create_mask(
+                                    p, cf,
+                                    s['mask_dilation'],
+                                    s['mask_feathering'],
+                                    cached_mask
+                                )
+                        
+                        else:  # Fast
+                            p = cv2.resize(p.astype(np.uint8), (target_w, target_h))
+                        
+                        # Ensure correct size
+                        if p.shape[0] != target_h or p.shape[1] != target_w:
+                            p = cv2.resize(p, (target_w, target_h))
+                        
+                        # Paste vào frame
+                        f[y1:y2, x1:x2] = p
+                        
+                        # Write frame
+                        if not s['preview_only']:
+                            out.write(f)
                     
-                    else:  # Fast
-                        p = cv2.resize(p.astype(np.uint8), (target_w, target_h))
-                    
-                    # Đảm bảo kích thước đúng
-                    if p.shape[0] != target_h or p.shape[1] != target_w:
-                        p = cv2.resize(p, (target_w, target_h))
-                    
-                    # Paste vào frame
-                    f[y1:y2, x1:x2] = p
-                    
-                    # Write frame
-                    if not s['preview_only']:
-                        out.write(f)
-                
-                # Clear batches
-                img_batch, mel_batch, frame_batch, coords_batch = [], [], [], []
+                    # Clear batches
+                    img_batch, mel_batch, frame_batch, coords_batch = [], [], [], []
+            
+            # Release video writer
+            out.release()
+            
+            # ================================================================
+            # STEP 7: PREVIEW MODE
+            # ================================================================
+            if s['preview_only']:
+                preview_path = output_path.replace('.mp4', '_preview.jpg')
+                cv2.imwrite(preview_path, f)
+                print(f"✅ Preview saved: {preview_path}")
+                return preview_path
+            
+            # ================================================================
+            # STEP 8: MERGE AUDIO
+            # ================================================================
+            print("🔊 Merging audio...")
+            
+            if not os.path.exists(temp_video):
+                raise FileNotFoundError(f"Temp video not found: {temp_video}")
+            
+            # Ensure output directory exists
+            os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
+            
+            # Merge with FFmpeg
+            ffmpeg_cmd = [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-i", temp_video,
+                "-i", audio_path,
+                "-c:v", "libx264",
+                "-preset", "medium",
+                "-crf", "18",
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-shortest",
+                output_path
+            ]
+            
+            subprocess.run(ffmpeg_cmd, check=True)
+            
+            # Cleanup temp
+            if os.path.exists(temp_video):
+                os.remove(temp_video)
+            
+            if os.path.exists(output_path):
+                file_size = os.path.getsize(output_path) / (1024 * 1024)
+                print(f"✅ Done! Output: {output_path} ({file_size:.1f} MB)")
+                return output_path
+            else:
+                raise FileNotFoundError(f"Output file not created: {output_path}")
         
-        # Release video writer
-        out.release()
-        
-        # ================================================================
-        # STEP 7: MERGE AUDIO
-        # ================================================================
-        if s['preview_only']:
-            # Chỉ save 1 frame preview
-            cv2.imwrite(output_path.replace('.mp4', '.jpg'), f)
-            print(f"✅ Preview saved: {output_path.replace('.mp4', '.jpg')}")
-            return output_path.replace('.mp4', '.jpg')
-        
-        print("🔊 Merging audio...")
-        
-        # Ensure temp video exists
-        if not os.path.exists(temp_video):
-            raise FileNotFoundError(f"Temp video not found: {temp_video}")
-        
-        # Convert audio to wav if needed
-        audio_wav = audio_path
-        if not audio_path.endswith('.wav'):
-            audio_wav = "temp/temp_audio.wav"
-            if not os.path.exists(audio_wav):
-                subprocess.check_call([
-                    "ffmpeg", "-y", "-loglevel", "error",
-                    "-i", audio_path, audio_wav
-                ])
-        
-        # Merge with FFmpeg
-        ffmpeg_cmd = [
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-i", temp_video,
-            "-i", audio_wav,
-            "-c:v", "libx264",
-            "-preset", "medium",
-            "-crf", "18",
-            "-c:a", "aac",
-            "-b:a", "192k",
-            "-shortest",
-            output_path
-        ]
-        
-        subprocess.run(ffmpeg_cmd, check=True)
-        
-        # Cleanup temp files
-        if os.path.exists(temp_video):
-            os.remove(temp_video)
-        
-        print(f"✅ Done! Output: {output_path}")
-        print(f"   Size: {os.path.getsize(output_path) / 1024 / 1024:.2f} MB")
-        
-        return output_path
+        except Exception as e:
+            print(f"❌ Error in process(): {e}")
+            import traceback
+            traceback.print_exc()
+            return None
     
     def create_cache(self, video_path, cache_file, target_frames=0, 
                      resize_height=0, pads=(0, 10, 0, 0)):
@@ -793,7 +924,7 @@ class Wav2LipEngine:
             video_path: Đường dẫn video
             cache_file: Đường dẫn output cache (.pkl)
             target_frames: Số frames cần tạo (0 = tất cả)
-            resize_height: Chiều cao resize
+            resize_height: Chiều cao resize (0 = giữ nguyên)
             pads: Padding cho face detection
         
         Returns:
@@ -837,29 +968,30 @@ class Wav2LipEngine:
 
 
 # ============================================================================
-# STANDALONE USAGE (Backward compatibility)
+# STANDALONE USAGE (CLI Compatibility)
 # ============================================================================
 
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description="Wav2Lip Inference")
-    parser.add_argument("--checkpoint_path", type=str, required=True)
-    parser.add_argument("--face", type=str, required=True)
-    parser.add_argument("--audio", type=str, required=True)
-    parser.add_argument("--outfile", type=str, default="results/result.mp4")
-    parser.add_argument("--quality", type=str, default="Enhanced")
+    parser = argparse.ArgumentParser(description="Wav2Lip Inference - Always-On Engine")
+    parser.add_argument("--checkpoint_path", type=str, required=True, help="Path to Wav2Lip model")
+    parser.add_argument("--face", type=str, required=True, help="Video or image file")
+    parser.add_argument("--audio", type=str, required=True, help="Audio file")
+    parser.add_argument("--outfile", type=str, default="results/result.mp4", help="Output path")
+    parser.add_argument("--quality", type=str, default="Enhanced", choices=["Fast", "Improved", "Enhanced"])
     parser.add_argument("--sharpen_amount", type=float, default=1.5)
     parser.add_argument("--enable_color_match", action="store_true")
     parser.add_argument("--mask_dilation", type=int, default=150)
-    parser.add_argument("--mask_feathering", type=int, default=151)
+    parser.add_argument("--mask_feathering", type=int, default=75)
     parser.add_argument("--mouth_tracking", action="store_true")
-    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--cache_file", type=str, default=None)
-    parser.add_argument("--only_detect", action="store_true")
+    parser.add_argument("--only_detect", action="store_true", help="Only create cache")
     parser.add_argument("--target_frames", type=int, default=0)
     parser.add_argument("--pads", nargs="+", type=int, default=[0, 10, 0, 0])
     parser.add_argument("--out_height", type=int, default=0)
+    parser.add_argument("--nosmooth", action="store_true")
     parser.add_argument("--preview_settings", action="store_true")
     
     args = parser.parse_args()
@@ -893,12 +1025,18 @@ if __name__ == "__main__":
             'cache_file': args.cache_file,
             'resize_height': args.out_height,
             'pads': tuple(args.pads),
+            'smooth_boxes': not args.nosmooth,
             'preview_only': args.preview_settings,
         }
         
-        engine.process(
+        result = engine.process(
             video_path=args.face,
             audio_path=args.audio,
             output_path=args.outfile,
             settings=settings
         )
+        
+        if result:
+            print(f"✅ Success: {result}")
+        else:
+            print("❌ Processing failed!")

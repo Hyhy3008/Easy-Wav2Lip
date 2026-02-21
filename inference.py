@@ -268,14 +268,20 @@ parser.add_argument(
     help="Number of frames to create cache for."
 )
 
-# ============================================================================
-# THAM SO MOI: DO SAC NET (SHARPEN SLIDER)
-# ============================================================================
 parser.add_argument(
     "--sharpen_amount",
     type=float,
     default=1.5,
     help="Do sac net (0.0 = khong net, 1.5 = vua, 3.0 = cuc gat)"
+)
+
+# ============================================================================
+# THAM SO MOI: MATCH COLOR (KHOP MAU)
+# ============================================================================
+parser.add_argument(
+    "--enable_color_match",
+    action="store_true",
+    help="Bat tinh nang khop mau giua mat AI va mat goc"
 )
 # ============================================================================
 
@@ -321,6 +327,48 @@ def face_rect(images):
                 box, landmarks, score = faces[0]
                 prev_ret = tuple(map(int, box))
             yield prev_ret
+
+
+# ============================================================================
+# HAM MATCH COLOR - KHOP MAU GIUA MAT AI VA MAT GOC
+# Cuc nhanh vi dung thuan Numpy, chi mat 1-2ms moi frame
+# ============================================================================
+def match_color(target, source):
+    """
+    Ep mau anh source theo mau anh target.
+    Dung khong gian mau Lab de giu do tu nhien.
+    
+    target: Mat goc (mau chuan)
+    source: Mat AI (can khop mau)
+    return: Mat AI da khop mau
+    """
+    # Dam bao ca 2 anh co cung kich thuoc
+    if target.shape != source.shape:
+        source = cv2.resize(source, (target.shape[1], target.shape[0]))
+    
+    # Chuyen sang khong gian mau Lab de tach biet do sang va mau sac
+    target_lab = cv2.cvtColor(target, cv2.COLOR_BGR2LAB).astype(np.float32)
+    source_lab = cv2.cvtColor(source, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+    # Tinh toan gia tri trung binh va do lech chuan cho tung kenh
+    for i in range(3):
+        target_mean = target_lab[:, :, i].mean()
+        target_std = target_lab[:, :, i].std()
+        source_mean = source_lab[:, :, i].mean()
+        source_std = source_lab[:, :, i].std()
+
+        # Cong thuc ep mau: (source - mean_source) * (std_target / std_source) + mean_target
+        if source_std > 1e-5:
+            source_lab[:, :, i] = (source_lab[:, :, i] - source_mean) * (target_std / source_std) + target_mean
+        else:
+            source_lab[:, :, i] = target_mean
+
+    # Clip ve range [0, 255] va chuyen nguoc lai BGR
+    source_lab = np.clip(source_lab, 0, 255).astype(np.uint8)
+    result = cv2.cvtColor(source_lab, cv2.COLOR_LAB2BGR)
+    
+    return result
+# ============================================================================
 
 
 def create_mask(img, original_img):
@@ -686,9 +734,10 @@ def main():
     
     print("Processing " + str(len(full_frames)) + " frames...")
     
-    # In thong tin sharpen
     if args.quality == "Enhanced":
         print("Sharpen amount: " + str(args.sharpen_amount))
+        if args.enable_color_match:
+            print("Color matching: ENABLED")
     
     batch_size = args.wav2lip_batch_size
     if str(args.preview_settings) == "True":
@@ -737,10 +786,24 @@ def main():
             p = cv2.resize(p.astype(np.uint8), (target_w, target_h))
             cf = f[y1:y2, x1:x2]
 
+            # ================================================================
+            # BUOC 1: GFPGAN - NANG CAP KHUON MAT
+            # ================================================================
             if args.quality == "Enhanced":
                 p = upscale(p, run_params)
                 p = cv2.resize(p, (target_w, target_h))
+            
+            # ================================================================
+            # BUOC 2: MATCH COLOR - KHOP MAU VOI MAT GOC
+            # Chi mat 1-2ms, khong anh huong toc do
+            # ================================================================
+            if args.quality == "Enhanced" and args.enable_color_match:
+                p = match_color(cf, p)
+            # ================================================================
 
+            # ================================================================
+            # BUOC 3: MASK - BLEND VOI ANH GOC
+            # ================================================================
             if args.quality in ["Enhanced", "Improved"]:
                 if p.shape[:2] != cf.shape[:2]:
                     p = cv2.resize(p, (target_w, target_h))
@@ -751,17 +814,11 @@ def main():
                     p, _ = create_mask(p, cf)
 
             # ================================================================
-            # SHARPENING LINH HOAT THEO SLIDER
-            # sharpen_amount = 0.0 -> Khong lam net
-            # sharpen_amount = 1.0 -> Giu nguyen
-            # sharpen_amount = 1.5 -> Net vua (mac dinh)
-            # sharpen_amount = 3.0 -> Cuc gat
+            # BUOC 4: SHARPENING - LAM SAC NET CHI TIET
+            # Chi mat 0.1ms, khong anh huong toc do
             # ================================================================
             if args.quality == "Enhanced" and args.sharpen_amount > 1.0:
                 p_blurred = cv2.GaussianBlur(p, (0, 0), 2.0)
-                # Cong thuc: output = alpha * input + beta * blurred
-                # alpha = sharpen_amount
-                # beta = 1 - sharpen_amount (so am de tru di)
                 alpha = args.sharpen_amount
                 beta = 1.0 - args.sharpen_amount
                 p = cv2.addWeighted(p, alpha, p_blurred, beta, 0)

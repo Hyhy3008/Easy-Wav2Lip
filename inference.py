@@ -1,11 +1,13 @@
 """
 Wav2LipEngine - Always-On Architecture (Parallel GPU Safe)
 ===========================================================
-Version: V18 Parallel Safe + CodeFormer Enhancer
+Version: V18 Parallel Safe + CodeFormer Enhancer + REALTIME STREAM
 - Unique temp paths per process (no conflict)
 - Multi-GPU parallel processing support
 - Model loaded once, reused multiple times
 - Enhanced mode uses CodeFormer (aligned-face enhance) if available
+- NEW: stream_frames_from_inputs() for realtime frame output
+- NEW: separate det_batch_size and wav_batch_size (backward compatible)
 """
 
 # ============================================================================
@@ -138,8 +140,7 @@ def match_color(target, source):
             source_lab[:, :, i] = target_mean
 
     source_lab = np.clip(source_lab, 0, 255).astype(np.uint8)
-    result = cv2.cvtColor(source_lab, cv2.COLOR_LAB2BGR)
-    return result
+    return cv2.cvtColor(source_lab, cv2.COLOR_LAB2BGR)
 
 
 def create_mask(img, original_img, mask_dilation=150, mask_feathering=151, cached_mask=None):
@@ -180,7 +181,6 @@ def create_mask(img, original_img, mask_dilation=150, mask_feathering=151, cache
     mask_3ch = cv2.cvtColor(mask_to_use, cv2.COLOR_GRAY2BGR).astype(np.float32) / 255.0
     out = (img.astype(np.float32) * mask_3ch + original_img.astype(np.float32) * (1 - mask_3ch))
     out = np.clip(out, 0, 255).astype(np.uint8)
-
     return out, mask_to_use
 
 
@@ -221,7 +221,6 @@ def create_tracked_mask(img, original_img, mask_dilation=150, mask_feathering=15
     mask_3ch = cv2.cvtColor(mask_to_use, cv2.COLOR_GRAY2BGR).astype(np.float32) / 255.0
     out = (img.astype(np.float32) * mask_3ch + original_img.astype(np.float32) * (1 - mask_3ch))
     out = np.clip(out, 0, 255).astype(np.uint8)
-
     return out, mask_to_use
 
 
@@ -242,7 +241,7 @@ def get_smoothened_boxes(boxes, T=5):
 class CodeFormerRestorer:
     """
     Minimal CodeFormer wrapper for aligned-face enhancement (no detection/alignment).
-    - Input: BGR uint8 face crop (any size)
+    - Input: BGR uint8 face crop
     - Process: resize -> CodeFormer -> output BGR uint8
     """
 
@@ -253,17 +252,15 @@ class CodeFormerRestorer:
         self.use_fp16 = bool(use_fp16)
         self.input_size = int(input_size)
 
-        # Import arch (requires CodeFormer installed so basicsr has codeformer_arch)
         try:
             from basicsr.archs.codeformer_arch import CodeFormer
         except Exception as e:
             raise ImportError(
                 "Cannot import basicsr.archs.codeformer_arch.CodeFormer.\n"
-                "You must install CodeFormer repo so that codeformer_arch is available.\n"
+                "Make sure CodeFormer arch was injected into basicsr.\n"
                 "Error: " + str(e)
             )
 
-        # Build net (official settings)
         self.net = CodeFormer(
             dim_embd=512,
             codebook_size=1024,
@@ -284,7 +281,6 @@ class CodeFormerRestorer:
             elif "state_dict" in ckpt:
                 state = ckpt["state_dict"]
             else:
-                # sometimes it's directly a state_dict
                 state = ckpt
         else:
             state = ckpt
@@ -297,25 +293,23 @@ class CodeFormerRestorer:
         if w is not None:
             self.w = float(w)
 
-        # resize to input_size for best restoration
         inp = cv2.resize(bgr_img, (self.input_size, self.input_size), interpolation=cv2.INTER_LANCZOS4)
         rgb = cv2.cvtColor(inp, cv2.COLOR_BGR2RGB)
 
-        x = torch.from_numpy(rgb).float() / 255.0  # HWC 0..1
-        x = x.permute(2, 0, 1).unsqueeze(0).to(self.device)  # 1,3,H,W
-        x = (x - 0.5) / 0.5  # to [-1,1]
+        x = torch.from_numpy(rgb).float() / 255.0
+        x = x.permute(2, 0, 1).unsqueeze(0).to(self.device)
+        x = (x - 0.5) / 0.5
 
         use_amp = (self.device.type == "cuda") and self.use_fp16
         with torch.cuda.amp.autocast(enabled=use_amp):
             out = self.net(x, w=self.w, adain=True)
 
-        # out can be tensor or (tensor, ...)
         if isinstance(out, (list, tuple)):
             out = out[0]
 
         out = out.squeeze(0).float().clamp(-1, 1).cpu()
-        out = (out + 1.0) / 2.0  # 0..1
-        out = (out.permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)  # RGB
+        out = (out + 1.0) / 2.0
+        out = (out.permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)
         out = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
         return out
 
@@ -326,8 +320,6 @@ class CodeFormerRestorer:
 class Wav2LipEngine:
     """
     Always-On Wav2Lip Engine - Parallel GPU Safe.
-    Load models 1 lần, gọi process() nhiều lần.
-    Mỗi process() sử dụng temp path riêng biệt để tránh conflict.
     """
 
     def __init__(
@@ -341,17 +333,6 @@ class Wav2LipEngine:
         codeformer_use_fp16=True,
         gfpgan_path="checkpoints/GFPGANv1.4.pth",
     ):
-        """
-        Args:
-            gpu_id: ID GPU
-            checkpoint_path: Wav2Lip weights
-            load_sr_model: nếu True sẽ load enhancer (CodeFormer hoặc GFPGAN)
-            sr_backend: "codeformer" (default) hoặc "gfpgan"
-            codeformer_path: path weights codeformer (.pth)
-            codeformer_w: fidelity weight (0..1). thấp = đẹp hơn, cao = giống gốc hơn
-            codeformer_use_fp16: dùng AMP fp16 trên cuda
-            gfpgan_path: path GFPGAN weights
-        """
         self.engine_id = gpu_id
 
         if torch.cuda.is_available():
@@ -371,7 +352,6 @@ class Wav2LipEngine:
         self.gfpgan_path = gfpgan_path
 
         if codeformer_path is None:
-            # common locations
             candidates = [
                 os.path.join("checkpoints", "codeformer.pth"),
                 os.path.join("checkpoints", "CodeFormer", "codeformer.pth"),
@@ -382,14 +362,12 @@ class Wav2LipEngine:
 
         print(f"🔌 Initializing Wav2LipEngine on {self.device}...")
 
-        # Load Wav2Lip model
         print(f"   Loading Wav2Lip model from {checkpoint_path}...")
         self.model = load_model(checkpoint_path)
         self.model = self.model.to(self.device)
         self.model.eval()
         print(f"   ✅ Wav2Lip model loaded!")
 
-        # Load Face Detector (RetinaFace)
         print(f"   Loading RetinaFace detector...")
         self.detector = RetinaFace(
             gpu_id=self.gpu_id,
@@ -398,7 +376,6 @@ class Wav2LipEngine:
         )
         print(f"   ✅ RetinaFace loaded!")
 
-        # Load enhancer
         self.sr_model = None
         if load_sr_model:
             print(f"   Loading Enhancer backend={self.sr_backend} ...")
@@ -408,11 +385,6 @@ class Wav2LipEngine:
         print(f"✅ Wav2LipEngine {gpu_id} Ready on {self.device}!")
 
     def _load_sr(self):
-        """
-        Load enhancer model on correct device.
-        - codeformer: CodeFormerRestorer
-        - gfpgan: GFPGANer (optional)
-        """
         if self.sr_backend == "codeformer":
             return CodeFormerRestorer(
                 model_path=self.codeformer_path,
@@ -440,17 +412,12 @@ class Wav2LipEngine:
         raise ValueError(f"Unknown sr_backend: {self.sr_backend}")
 
     def _enhance(self, image_bgr_uint8, codeformer_w=None):
-        """
-        Enhance face crop using selected backend.
-        """
         if self.sr_model is None:
             return image_bgr_uint8
-
         try:
             if self.sr_backend == "codeformer":
                 return self.sr_model.enhance_aligned(image_bgr_uint8, w=codeformer_w)
             else:
-                # GFPGAN path
                 _, restored_faces, _ = self.sr_model.enhance(
                     image_bgr_uint8,
                     has_aligned=True,
@@ -467,11 +434,9 @@ class Wav2LipEngine:
     def _face_rect_generator(self, images, batch_size=16):
         num_batches = math.ceil(len(images) / batch_size)
         prev_ret = None
-
         for i in range(num_batches):
             batch = images[i * batch_size: (i + 1) * batch_size]
             all_faces = self.detector(batch)
-
             for faces in all_faces:
                 if faces:
                     box, landmarks, score = faces[0]
@@ -482,13 +447,10 @@ class Wav2LipEngine:
                      batch_size=16, smooth=True):
         if cache_file and os.path.exists(cache_file):
             print(f"📦 Loading face cache: {cache_file}")
-            try:
-                with open(cache_file, "rb") as f:
-                    cached = pickle.load(f)
-                print(f"   ✅ Loaded {len(cached)} cached entries")
-                return cached
-            except Exception as e:
-                print(f"   ⚠️ Cache load failed: {e}, detecting faces...")
+            with open(cache_file, "rb") as f:
+                cached = pickle.load(f)
+            print(f"   ✅ Loaded {len(cached)} cached entries")
+            return cached
 
         print(f"🔍 Detecting faces for {len(images)} frames...")
         results = []
@@ -510,26 +472,21 @@ class Wav2LipEngine:
             results.append([x1, y1, x2, y2])
 
         boxes = np.array(results, dtype=np.int32)
-
         if smooth:
             boxes = get_smoothened_boxes(boxes, T=5)
 
         final_results = []
         for i, (x1, y1, x2, y2) in enumerate(boxes):
-            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
             face_crop = images[i][y1:y2, x1:x2].copy()
             final_results.append([face_crop, (y1, y2, x1, x2)])
 
         if cache_file:
-            try:
-                cache_dir = os.path.dirname(cache_file)
-                if cache_dir:
-                    os.makedirs(cache_dir, exist_ok=True)
-                with open(cache_file, "wb") as f:
-                    pickle.dump(final_results, f)
-                print(f"   💾 Saved cache: {len(final_results)} entries -> {cache_file}")
-            except Exception as e:
-                print(f"   ⚠️ Cache save failed: {e}")
+            cache_dir = os.path.dirname(cache_file)
+            if cache_dir:
+                os.makedirs(cache_dir, exist_ok=True)
+            with open(cache_file, "wb") as f:
+                pickle.dump(final_results, f)
+            print(f"   💾 Saved cache: {len(final_results)} entries -> {cache_file}")
 
         return final_results
 
@@ -544,7 +501,7 @@ class Wav2LipEngine:
         if not video.isOpened():
             raise ValueError(f"Cannot open video: {video_path}")
 
-        fps = video.get(cv2.CAP_PROP_FPS)
+        fps = video.get(cv2.CAP_PROP_FPS) or 25.0
         frames = []
         while True:
             ret, frame = video.read()
@@ -567,7 +524,6 @@ class Wav2LipEngine:
             frames.append(frame)
 
         video.release()
-
         if len(frames) == 0:
             raise ValueError(f"No frames loaded from video: {video_path}")
 
@@ -580,9 +536,7 @@ class Wav2LipEngine:
         os.makedirs("temp", exist_ok=True)
 
         need_cleanup = False
-
         if not audio_path.endswith('.wav'):
-            print("🔊 Converting audio to WAV...")
             subprocess.run([
                 "ffmpeg", "-y", "-loglevel", "error",
                 "-i", audio_path, "-ac", "1", "-ar", "16000", temp_wav
@@ -590,7 +544,6 @@ class Wav2LipEngine:
             audio_path = temp_wav
             need_cleanup = True
 
-        print("🔊 Analyzing audio...")
         wav = audio.load_wav(audio_path, 16000)
         mel = audio.melspectrogram(wav)
 
@@ -600,7 +553,6 @@ class Wav2LipEngine:
         mel_chunks = []
         mel_idx_multiplier = 80.0 / fps
         i = 0
-
         while True:
             start_idx = int(i * mel_idx_multiplier)
             if start_idx + MEL_STEP_SIZE > len(mel[0]):
@@ -615,7 +567,6 @@ class Wav2LipEngine:
             except:
                 pass
 
-        print(f"   ✅ Created {len(mel_chunks)} mel chunks")
         return mel_chunks
 
     def _prepare_batch(self, faces, mels):
@@ -632,6 +583,148 @@ class Wav2LipEngine:
         mel_tensor = torch.FloatTensor(np.transpose(mel_batch, (0, 3, 1, 2))).to(self.device)
         return img_tensor, mel_tensor
 
+    # ============================================================================
+    # REALTIME STREAM API
+    # ============================================================================
+    def stream_frames_from_inputs(
+        self,
+        frames,
+        mel_chunks,
+        coords_list,
+        settings=None,
+        abs_indices=None,          # list[int] frame_idx tuyệt đối cho mỗi mel (merge multi-GPU)
+        frame_callback=None,       # fn(abs_idx:int, out_frame_bgr:np.ndarray)
+    ):
+        """
+        REAL-TIME: xuất frame ngay khi render xong (không ghi mp4).
+        - frames: list BGR frames (idle frames preload)
+        - mel_chunks: list mel chunks (len = số frame cần)
+        - coords_list: list (y1,y2,x1,x2) tương ứng frames (hoặc loop)
+        - abs_indices: mapping index tuyệt đối (để merge even/odd GPU)
+        - frame_callback: gọi ngay khi xong 1 frame
+
+        Nếu frame_callback=None -> yield (abs_idx, frame)
+        """
+        s = {
+            "quality": "Enhanced",
+            "enable_color_match": False,
+            "sharpen_amount": 0,
+            "mask_dilation": 75,
+            "mask_feathering": 75,
+            # ⚠️ multi-GPU even/odd: tracking state sẽ lệch; default False cho ổn định
+            "mouth_tracking": False,
+            "debug_mask": False,
+            "codeformer_w": None,
+            "wav_batch_size": 256,
+        }
+        if settings:
+            s.update(settings)
+
+        if abs_indices is None:
+            abs_indices = list(range(len(mel_chunks)))
+
+        fN = len(frames)
+        cN = len(coords_list)
+        n = len(mel_chunks)
+        if n == 0:
+            return
+
+        wav_bs = int(s.get("wav_batch_size", 256))
+        wav_bs = max(1, min(wav_bs, 256))
+
+        cached_mask = None
+        last_tracked_mask = None
+
+        img_batch, mel_batch, frame_batch, coords_batch, idx_batch = [], [], [], [], []
+
+        def _emit(ii, fr):
+            if frame_callback is not None:
+                frame_callback(ii, fr)
+                return None
+            return (ii, fr)
+
+        for local_i in range(n):
+            abs_i = int(abs_indices[local_i])
+
+            frame = frames[abs_i % fN].copy()
+            y1, y2, x1, x2 = coords_list[abs_i % cN]
+
+            y1 = max(0, int(y1)); y2 = min(frame.shape[0], int(y2))
+            x1 = max(0, int(x1)); x2 = min(frame.shape[1], int(x2))
+
+            if y2 <= y1 or x2 <= x1:
+                emitted = _emit(abs_i, frame)
+                if emitted is not None:
+                    yield emitted
+                continue
+
+            face = frame[y1:y2, x1:x2].copy()
+            face_resized = cv2.resize(face, (IMG_SIZE, IMG_SIZE))
+
+            img_batch.append(face_resized)
+            mel_batch.append(mel_chunks[local_i])
+            frame_batch.append(frame)
+            coords_batch.append((y1, y2, x1, x2))
+            idx_batch.append(abs_i)
+
+            if len(img_batch) < wav_bs and local_i != n - 1:
+                continue
+
+            img_tensor, mel_tensor = self._prepare_batch(img_batch, mel_batch)
+            with torch.no_grad():
+                pred = self.model(mel_tensor, img_tensor)
+
+            pred = pred.cpu().numpy().transpose(0, 2, 3, 1) * 255.0
+            pred = np.clip(pred, 0, 255).astype(np.uint8)
+
+            for p, out_frame, c, out_idx in zip(pred, frame_batch, coords_batch, idx_batch):
+                y1, y2, x1, x2 = c
+                th, tw = (y2 - y1), (x2 - x1)
+                cf = out_frame[y1:y2, x1:x2].copy()
+
+                if s["quality"] == "Enhanced" and self.sr_model is not None:
+                    p = self._enhance(p, codeformer_w=s.get("codeformer_w", None))
+                    p = cv2.resize(p, (tw, th), interpolation=cv2.INTER_LANCZOS4)
+
+                    if float(s["sharpen_amount"]) > 0:
+                        k = float(s["sharpen_amount"])
+                        sharpen_kernel = np.array([
+                            [0, -1, 0],
+                            [-1, k + 3.5, -1],
+                            [0, -1, 0]
+                        ]) / (k + 0.5)
+                        p = cv2.filter2D(p, -1, sharpen_kernel)
+                        p = np.clip(p, 0, 255).astype(np.uint8)
+
+                    if s["enable_color_match"]:
+                        p = match_color(cf, p)
+
+                    # multi-GPU stable default: cached mask
+                    if s["mouth_tracking"]:
+                        p, last_tracked_mask = create_tracked_mask(
+                            p, cf, s["mask_dilation"], s["mask_feathering"], last_tracked_mask
+                        )
+                    else:
+                        p, cached_mask = create_mask(
+                            p, cf, s["mask_dilation"], s["mask_feathering"], cached_mask
+                        )
+
+                elif s["quality"] == "Improved":
+                    p = cv2.resize(p, (tw, th))
+                else:
+                    p = cv2.resize(p, (tw, th))
+
+                out_frame[y1:y2, x1:x2] = p
+
+                emitted = _emit(out_idx, out_frame)
+                if emitted is not None:
+                    yield emitted
+
+            img_batch, mel_batch, frame_batch, coords_batch, idx_batch = [], [], [], [], []
+
+    # ============================================================================
+    # OFFLINE PROCESS (kept for compatibility)
+    # ============================================================================
     def process(self, video_path, audio_path, output_path, settings=None):
         s = {
             'quality': 'Enhanced',
@@ -640,7 +733,14 @@ class Wav2LipEngine:
             'mask_dilation': 150,
             'mask_feathering': 75,
             'mouth_tracking': False,
+
+            # backward compatible:
             'batch_size': 16,
+            # NEW:
+            'det_batch_size': None,
+            'wav_batch_size': None,
+            'wav_batch_cap': 256,   # default for dual T4 stability
+
             'resize_height': 0,
             'crop': (0, -1, 0, -1),
             'pads': (0, 10, 0, 0),
@@ -649,84 +749,53 @@ class Wav2LipEngine:
             'debug_mask': False,
             'preview_only': False,
 
-            # CodeFormer setting (optional override per run)
-            'codeformer_w': None,  # None => use engine default
+            'codeformer_w': None,
         }
         if settings:
             s.update(settings)
 
-        print("=" * 60)
-        print(f"🎬 WAV2LIP PROCESSING [GPU {self.engine_id}]")
-        print("=" * 60)
-        print(f"   Quality: {s['quality']}")
-        print(f"   Sharpen: {s['sharpen_amount']}")
-        print(f"   Color Match: {s['enable_color_match']}")
-        print(f"   Mask: dilation={s['mask_dilation']}, feather={s['mask_feathering']}")
-        print(f"   Mouth Tracking: {s['mouth_tracking']}")
-        print(f"   Batch Size: {s['batch_size']}")
-        if self.sr_model is not None:
-            if self.sr_backend == "codeformer":
-                print(f"   Enhancer: CodeFormer (w={s['codeformer_w'] if s['codeformer_w'] is not None else self.codeformer_w})")
-            else:
-                print(f"   Enhancer: GFPGAN")
-        else:
-            print(f"   Enhancer: None")
-        print("=" * 60)
+        # backward compatibility
+        if s['det_batch_size'] is None:
+            s['det_batch_size'] = int(s.get('batch_size', 16))
+        if s['wav_batch_size'] is None:
+            s['wav_batch_size'] = int(s.get('batch_size', 16))
 
         temp_video = None
         out = None
 
         try:
-            # STEP 1: LOAD VIDEO
             resize_h = s['resize_height'] if s['resize_height'] > 0 else None
             full_frames, fps = self._load_video(video_path, resize_h, s['crop'])
-
             if s['preview_only']:
                 full_frames = [full_frames[0]]
 
-            # STEP 2: LOAD AUDIO
             mel_chunks = self._load_audio(audio_path, fps)
-
             if s['preview_only']:
                 mel_chunks = [mel_chunks[0]]
 
-            # STEP 3: SYNC LENGTH
-            print(f"📊 Sync Info:")
-            print(f"   Video: {len(full_frames)} frames")
-            print(f"   Audio: {len(mel_chunks)} mel chunks")
-
             if len(mel_chunks) > len(full_frames):
-                print("   ⚠️ Audio longer than video - Looping video...")
-                original_len = len(full_frames)
-                looped_frames = []
-                while len(looped_frames) < len(mel_chunks):
-                    looped_frames.extend(full_frames)
-                full_frames = looped_frames[:len(mel_chunks)]
-                print(f"   ✅ Looped: {original_len} -> {len(full_frames)} frames")
+                looped = []
+                while len(looped) < len(mel_chunks):
+                    looped.extend(full_frames)
+                full_frames = looped[:len(mel_chunks)]
             else:
                 full_frames = full_frames[:len(mel_chunks)]
-                print(f"   ✅ Trimmed to: {len(full_frames)} frames")
 
-            # STEP 4: FACE DETECTION
             face_det_results = self._face_detect(
                 full_frames,
                 cache_file=s['cache_file'],
                 pads=s['pads'],
-                batch_size=s['batch_size'],
+                batch_size=int(s['det_batch_size']),
                 smooth=s['smooth_boxes']
             )
 
-            # SYNC FIX
             num_synced = min(len(full_frames), len(face_det_results), len(mel_chunks))
             full_frames = full_frames[:num_synced]
             face_det_results = face_det_results[:num_synced]
             mel_chunks = mel_chunks[:num_synced]
-
-            print(f"   🔄 Synced to: {num_synced} frames")
             if num_synced == 0:
                 raise ValueError("No frames to process after sync!")
 
-            # STEP 5: OUTPUT TEMP VIDEO UNIQUE
             frame_h, frame_w = full_frames[0].shape[:2]
 
             unique_id = uuid.uuid4().hex[:8]
@@ -739,15 +808,13 @@ class Wav2LipEngine:
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             out = cv2.VideoWriter(temp_video, fourcc, fps, (frame_w, frame_h))
 
-            # STEP 6: INFERENCE LOOP
-            print(f"🚀 Processing {num_synced} frames...")
-
             cached_mask = None
             last_tracked_mask = None
 
-            batch_size = min(int(s['batch_size']), 128)
-            img_batch, mel_batch, frame_batch, coords_batch = [], [], [], []
+            infer_bs = int(s['wav_batch_size'])
+            infer_bs = max(1, min(infer_bs, int(s.get('wav_batch_cap', 256))))
 
+            img_batch, mel_batch, frame_batch, coords_batch = [], [], [], []
             for idx, mel in enumerate(tqdm(mel_chunks, desc="Processing", ncols=100)):
                 frame = full_frames[idx].copy()
                 face, coords = face_det_results[idx]
@@ -758,189 +825,115 @@ class Wav2LipEngine:
                 frame_batch.append(frame)
                 coords_batch.append(coords)
 
-                if len(img_batch) >= batch_size or idx == len(mel_chunks) - 1:
-                    img_tensor, mel_tensor = self._prepare_batch(img_batch, mel_batch)
+                if len(img_batch) < infer_bs and idx != len(mel_chunks) - 1:
+                    continue
 
-                    with torch.no_grad():
-                        pred = self.model(mel_tensor, img_tensor)
+                img_tensor, mel_tensor = self._prepare_batch(img_batch, mel_batch)
+                with torch.no_grad():
+                    pred = self.model(mel_tensor, img_tensor)
 
-                    # IMPORTANT: clip before uint8 to avoid wrap artefacts
-                    pred = pred.cpu().numpy().transpose(0, 2, 3, 1) * 255.0
-                    pred = np.clip(pred, 0, 255).astype(np.uint8)
+                pred = pred.cpu().numpy().transpose(0, 2, 3, 1) * 255.0
+                pred = np.clip(pred, 0, 255).astype(np.uint8)
 
-                    for p, f, c in zip(pred, frame_batch, coords_batch):
-                        y1, y2, x1, x2 = c
-                        target_h = y2 - y1
-                        target_w = x2 - x1
+                for p, f, c in zip(pred, frame_batch, coords_batch):
+                    y1, y2, x1, x2 = c
+                    th, tw = (y2 - y1), (x2 - x1)
+                    if th <= 0 or tw <= 0:
+                        out.write(f)
+                        continue
 
-                        if target_h <= 0 or target_w <= 0:
-                            out.write(f)
-                            continue
+                    if s['debug_mask']:
+                        f = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+                        f = cv2.cvtColor(f, cv2.COLOR_GRAY2BGR)
 
-                        if s['debug_mask']:
-                            f = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
-                            f = cv2.cvtColor(f, cv2.COLOR_GRAY2BGR)
+                    cf = f[y1:y2, x1:x2].copy()
 
-                        cf = f[y1:y2, x1:x2].copy()
+                    if s['quality'] == "Enhanced" and self.sr_model is not None:
+                        p = self._enhance(p, codeformer_w=s.get('codeformer_w', None))
+                        p = cv2.resize(p, (tw, th), interpolation=cv2.INTER_LANCZOS4)
 
-                        if s['quality'] == "Enhanced" and self.sr_model is not None:
-                            # 1) Enhance (CodeFormer/GFPGAN) on aligned face
-                            #    p currently is 96x96 predicted face; enhance works better if run before resizing to target
-                            p = self._enhance(p, codeformer_w=s.get('codeformer_w', None))
+                        if float(s['sharpen_amount']) > 0:
+                            k = float(s['sharpen_amount'])
+                            sharpen_kernel = np.array([
+                                [0, -1, 0],
+                                [-1, k + 3.5, -1],
+                                [0, -1, 0]
+                            ]) / (k + 0.5)
+                            p = cv2.filter2D(p, -1, sharpen_kernel)
+                            p = np.clip(p, 0, 255).astype(np.uint8)
 
-                            # 2) Resize to target (high quality interpolation)
-                            p = cv2.resize(p, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+                        if s['enable_color_match']:
+                            p = match_color(cf, p)
 
-                            # 3) Sharpen
-                            if float(s['sharpen_amount']) > 0:
-                                k = float(s['sharpen_amount'])
-                                sharpen_kernel = np.array([
-                                    [0, -1, 0],
-                                    [-1, k + 3.5, -1],
-                                    [0, -1, 0]
-                                ]) / (k + 0.5)
-                                p = cv2.filter2D(p, -1, sharpen_kernel)
-                                p = np.clip(p, 0, 255).astype(np.uint8)
-
-                            # 4) Color match
-                            if s['enable_color_match']:
-                                p = match_color(cf, p)
-
-                            # 5) Mask blend
-                            if s['mouth_tracking']:
-                                p, last_tracked_mask = create_tracked_mask(
-                                    p, cf,
-                                    s['mask_dilation'],
-                                    s['mask_feathering'],
-                                    last_tracked_mask
-                                )
-                            else:
-                                p, cached_mask = create_mask(
-                                    p, cf,
-                                    s['mask_dilation'],
-                                    s['mask_feathering'],
-                                    cached_mask
-                                )
-
-                        elif s['quality'] == "Improved":
-                            p = cv2.resize(p, (target_w, target_h))
-
-                            if s['mouth_tracking']:
-                                p, last_tracked_mask = create_tracked_mask(
-                                    p, cf,
-                                    s['mask_dilation'],
-                                    s['mask_feathering'],
-                                    last_tracked_mask
-                                )
-                            else:
-                                p, cached_mask = create_mask(
-                                    p, cf,
-                                    s['mask_dilation'],
-                                    s['mask_feathering'],
-                                    cached_mask
-                                )
+                        if s['mouth_tracking']:
+                            p, last_tracked_mask = create_tracked_mask(
+                                p, cf, s['mask_dilation'], s['mask_feathering'], last_tracked_mask
+                            )
                         else:
-                            p = cv2.resize(p, (target_w, target_h))
+                            p, cached_mask = create_mask(
+                                p, cf, s['mask_dilation'], s['mask_feathering'], cached_mask
+                            )
+                    elif s['quality'] == "Improved":
+                        p = cv2.resize(p, (tw, th))
+                    else:
+                        p = cv2.resize(p, (tw, th))
 
-                        if p.shape[0] != target_h or p.shape[1] != target_w:
-                            p = cv2.resize(p, (target_w, target_h))
+                    f[y1:y2, x1:x2] = p
+                    if not s['preview_only']:
+                        out.write(f)
 
-                        f[y1:y2, x1:x2] = p
-
-                        if not s['preview_only']:
-                            out.write(f)
-
-                    img_batch, mel_batch, frame_batch, coords_batch = [], [], [], []
+                img_batch, mel_batch, frame_batch, coords_batch = [], [], [], []
 
             out.release()
             out = None
 
-            # STEP 7: PREVIEW MODE
             if s['preview_only']:
                 preview_path = output_path.replace('.mp4', '_preview.jpg')
                 cv2.imwrite(preview_path, f)
-                print(f"✅ Preview saved: {preview_path}")
                 if temp_video and os.path.exists(temp_video):
-                    try:
-                        os.remove(temp_video)
-                    except:
-                        pass
+                    try: os.remove(temp_video)
+                    except: pass
                 return preview_path
 
-            # STEP 8: MERGE AUDIO
-            print("🔊 Merging audio...")
-
-            if not os.path.exists(temp_video):
-                raise FileNotFoundError(f"Temp video not found: {temp_video}")
-
-            output_dir = os.path.dirname(output_path)
-            if output_dir:
-                os.makedirs(output_dir, exist_ok=True)
-
             ffmpeg_cmd = [
-                "ffmpeg", "-y",
-                "-loglevel", "error",
+                "ffmpeg", "-y", "-loglevel", "error",
                 "-i", temp_video,
                 "-i", audio_path,
-                "-c:v", "libx264",
-                "-preset", "fast",
-                "-crf", "18",
-                "-c:a", "aac",
-                "-b:a", "192k",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                "-c:a", "aac", "-b:a", "192k",
                 "-shortest",
                 output_path
             ]
-
             r = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             if r.returncode != 0:
-                raise RuntimeError(f"FFmpeg merge failed:\n{r.stderr[:2000]}")
+                raise RuntimeError(f"FFmpeg merge failed:\n{r.stderr[:1500]}")
 
             if temp_video and os.path.exists(temp_video):
-                try:
-                    os.remove(temp_video)
-                except:
-                    pass
+                try: os.remove(temp_video)
+                except: pass
 
-            if os.path.exists(output_path):
-                file_size = os.path.getsize(output_path) / (1024 * 1024)
-                print(f"✅ Done! Output: {output_path} ({file_size:.1f} MB)")
-                return output_path
-            else:
-                raise FileNotFoundError(f"Output file not created: {output_path}")
+            return output_path if os.path.exists(output_path) else None
 
         except Exception as e:
             print(f"❌ Error in process(): {e}")
             import traceback
             traceback.print_exc()
-
             try:
                 if out is not None:
                     out.release()
             except:
                 pass
-
             if temp_video and os.path.exists(temp_video):
-                try:
-                    os.remove(temp_video)
-                except:
-                    pass
-
+                try: os.remove(temp_video)
+                except: pass
             return None
 
     def create_cache(self, video_path, cache_file, target_frames=0,
-                     resize_height=0, pads=(0, 10, 0, 0)):
-        print("=" * 60)
-        print("📦 CACHE CREATION MODE")
-        print("=" * 60)
-
+                     resize_height=0, pads=(0, 10, 0, 0), det_batch_size=16):
         resize_h = resize_height if resize_height > 0 else None
         frames, fps = self._load_video(video_path, resize_h)
 
-        print(f"   Original: {len(frames)} frames")
-        print(f"   Target: {target_frames if target_frames > 0 else 'All'}")
-
         if target_frames > 0 and target_frames > len(frames):
-            print(f"   Looping to reach {target_frames} frames...")
             looped = []
             while len(looped) < target_frames:
                 looped.extend(frames)
@@ -950,93 +943,6 @@ class Wav2LipEngine:
 
         if os.path.exists(cache_file):
             os.remove(cache_file)
-            print(f"   Deleted old cache")
 
-        results = self._face_detect(frames, cache_file=cache_file, pads=pads)
-
-        print("=" * 60)
-        print(f"✅ Cache created: {cache_file}")
-        print(f"   Total entries: {len(results)}")
-        print("=" * 60)
-
+        results = self._face_detect(frames, cache_file=cache_file, pads=pads, batch_size=int(det_batch_size))
         return len(results)
-
-
-# ============================================================================
-# STANDALONE USAGE (CLI Compatibility)
-# ============================================================================
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Wav2Lip Inference - Always-On Engine (CodeFormer)")
-    parser.add_argument("--checkpoint_path", type=str, required=True, help="Path to Wav2Lip model")
-    parser.add_argument("--face", type=str, required=True, help="Video or image file")
-    parser.add_argument("--audio", type=str, required=True, help="Audio file")
-    parser.add_argument("--outfile", type=str, default="results/result.mp4", help="Output path")
-    parser.add_argument("--quality", type=str, default="Enhanced", choices=["Fast", "Improved", "Enhanced"])
-
-    parser.add_argument("--sr_backend", type=str, default="codeformer", choices=["codeformer", "gfpgan"])
-    parser.add_argument("--codeformer_path", type=str, default=None)
-    parser.add_argument("--codeformer_w", type=float, default=0.5)
-
-    parser.add_argument("--sharpen_amount", type=float, default=0)
-    parser.add_argument("--enable_color_match", action="store_true")
-    parser.add_argument("--mask_dilation", type=int, default=150)
-    parser.add_argument("--mask_feathering", type=int, default=75)
-    parser.add_argument("--mouth_tracking", action="store_true")
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--cache_file", type=str, default=None)
-    parser.add_argument("--only_detect", action="store_true", help="Only create cache")
-    parser.add_argument("--target_frames", type=int, default=0)
-    parser.add_argument("--pads", nargs="+", type=int, default=[0, 10, 0, 0])
-    parser.add_argument("--out_height", type=int, default=0)
-    parser.add_argument("--nosmooth", action="store_true")
-    parser.add_argument("--preview_settings", action="store_true")
-
-    args = parser.parse_args()
-
-    engine = Wav2LipEngine(
-        gpu_id=0,
-        checkpoint_path=args.checkpoint_path,
-        load_sr_model=(args.quality == "Enhanced"),
-        sr_backend=args.sr_backend,
-        codeformer_path=args.codeformer_path,
-        codeformer_w=args.codeformer_w
-    )
-
-    if args.only_detect:
-        engine.create_cache(
-            video_path=args.face,
-            cache_file=args.cache_file or "master_cache.pkl",
-            target_frames=args.target_frames,
-            resize_height=args.out_height,
-            pads=tuple(args.pads)
-        )
-    else:
-        settings = {
-            'quality': args.quality,
-            'sharpen_amount': args.sharpen_amount,
-            'enable_color_match': args.enable_color_match,
-            'mask_dilation': args.mask_dilation,
-            'mask_feathering': args.mask_feathering,
-            'mouth_tracking': args.mouth_tracking,
-            'batch_size': args.batch_size,
-            'cache_file': args.cache_file,
-            'resize_height': args.out_height,
-            'pads': tuple(args.pads),
-            'smooth_boxes': not args.nosmooth,
-            'preview_only': args.preview_settings,
-            'codeformer_w': args.codeformer_w,
-        }
-
-        result = engine.process(
-            video_path=args.face,
-            audio_path=args.audio,
-            output_path=args.outfile,
-            settings=settings
-        )
-
-        if result:
-            print(f"✅ Success: {result}")
-        else:
-            print("❌ Processing failed!")

@@ -630,7 +630,7 @@ class Wav2LipEngine:
             return
 
         wav_bs = int(s.get("wav_batch_size", 256))
-        wav_bs = max(1, min(wav_bs, 256))
+        wav_bs = max(1, wav_bs)
 
         cached_mask = None
         last_tracked_mask = None
@@ -812,7 +812,7 @@ class Wav2LipEngine:
             last_tracked_mask = None
 
             infer_bs = int(s['wav_batch_size'])
-            infer_bs = max(1, min(infer_bs, int(s.get('wav_batch_cap', 256))))
+            infer_bs = max(1, infer_bs)
 
             img_batch, mel_batch, frame_batch, coords_batch = [], [], [], []
             for idx, mel in enumerate(tqdm(mel_chunks, desc="Processing", ncols=100)):
